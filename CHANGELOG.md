@@ -10,6 +10,9 @@ e este projeto adere ao [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 ### Added
 
 - Adicionado `CLAUDE.md` com convencoes do projeto para orientar agentes de IA
+- **TJRJ (PJe):** novo scraper `TJRJScraper` via consulta pública do PJe (`tjrj.pje.jus.br`).
+  Disponível via `jus.scraper("tjrj")`. Métodos `cpopg` e `cposg` retornam partes,
+  valor da causa e movimentações de processos de 1º e 2º grau.
 
 ### Changed
 
