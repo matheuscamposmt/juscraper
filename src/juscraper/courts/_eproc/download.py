@@ -10,10 +10,10 @@ Uma consulta por número custa duas requisições, mais as repetições do captc
    ``eproc1g.tjmg`` para ``eproc-consulta-publica-1g.tjmg``; o POST ao host
    antigo vira GET no redirecionamento e o formulário se perde.
 
-Rate limit: :class:`SessaoEspacada` espera ``espera`` segundos entre
-requisições ao mesmo host, com uma trava em arquivo que vale para todos os
-processos da máquina. HTTP 403, 429, 5xx ou aviso de excesso levantam
-:class:`Sobrecarga`, e quem chama faz o backoff.
+Rate limit: :class:`juscraper.core.ritmo.SessaoRitmada`. Uma requisição por
+vez por host, com intervalo adaptativo: dobra a cada recusa (403, 429, 5xx,
+aviso de excesso) e encolhe a cada resposta boa. :class:`Sobrecarga` sobe
+para quem chama depois de ``RECUSAS_SEGUIDAS`` recusas.
 
 Tipo de captcha por tribunal, medido em 09/11/2026 por GET a partir de um IP
 da AWS:
@@ -28,27 +28,23 @@ da AWS:
 from __future__ import annotations
 
 import base64
-import fcntl
 import re
-import time
 from collections.abc import Callable
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urljoin
 
-import requests
 from bs4 import BeautifulSoup
+
+from juscraper.core.ritmo import SessaoRitmada, Sobrecarga
 
 from . import captcha as ocr
 
+__all__ = ["SessaoRitmada", "Sobrecarga", "consulta_numero", "estado", "url_consulta"]
+
 NADA = "Nenhum registro encontrado"
 RECUSA = re.compile(r"captcha\)? incorreto", re.I)
-SOBRECARGA = re.compile(r"consultas simult|too many requests|excesso de (acessos|requisi)", re.I)
 TENTATIVAS = 12
-ESPERA = 6.0
-"""Segundos entre duas requisições ao mesmo host."""
-USER_AGENT = (
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/130.0 Safari/537.36"
-)
+RECUSAS_SEGUIDAS = 6
+"""Recusas por volume seguidas antes de a Sobrecarga subir para quem chama."""
 
 URLS: dict[tuple[str, int], str] = {
     ("tjmg", 1): "https://eproc-consulta-publica-1g.tjmg.jus.br/eproc/externo_controlador.php"
@@ -65,70 +61,6 @@ def url_consulta(tribunal: str, grau: int = 1) -> str:
         f"https://eproc{grau}g.{tribunal}.jus.br/eproc/externo_controlador.php"
         "?acao=processo_consulta_publica"
     )
-
-
-class Sobrecarga(Exception):
-    """O tribunal pediu para diminuir o ritmo (403, 429, 5xx ou aviso na página)."""
-
-
-def _arq_ritmo(host: str) -> str:
-    return f"/tmp/juscraper_ritmo_{re.sub(r'[^a-z0-9.]', '_', host.lower())}"
-
-
-def _sua_vez(host: str, espera: float) -> None:
-    """Uma requisição por vez em cada host, com ``espera`` segundos entre elas.
-
-    A trava é um arquivo por host em ``/tmp``, então vale entre processos.
-    """
-    with open(_arq_ritmo(host), "a+", encoding="ascii") as fh:
-        fcntl.flock(fh, fcntl.LOCK_EX)
-        fh.seek(0)
-        ultimo = float(fh.read().strip() or 0)
-        falta = ultimo + espera - time.time()
-        if falta > 0:
-            time.sleep(falta)
-        fh.seek(0)
-        fh.truncate()
-        fh.write(str(time.time()))
-        fh.flush()
-        fcntl.flock(fh, fcntl.LOCK_UN)
-
-
-def _marca_fim(host: str) -> None:
-    """Conta a espera a partir do fim da resposta."""
-    with open(_arq_ritmo(host), "a+", encoding="ascii") as fh:
-        fcntl.flock(fh, fcntl.LOCK_EX)
-        fh.seek(0)
-        fh.truncate()
-        fh.write(str(time.time()))
-        fh.flush()
-        fcntl.flock(fh, fcntl.LOCK_UN)
-
-
-class SessaoEspacada(requests.Session):
-    """``requests.Session`` que espera ``espera`` segundos entre requisições ao mesmo host."""
-
-    espera: float = ESPERA
-
-    def __init__(self, espera: float | None = None) -> None:
-        super().__init__()
-        self.headers["User-Agent"] = USER_AGENT
-        if espera is not None:
-            self.espera = espera
-
-    def request(self, method, url, *args, **kwargs):  # type: ignore[override]
-        host = urlparse(url).netloc
-        _sua_vez(host, self.espera)
-        kwargs.setdefault("timeout", 60)
-        try:
-            resp = super().request(method, url, *args, **kwargs)
-        finally:
-            _marca_fim(host)
-        if resp.status_code in (403, 429) or resp.status_code >= 500:
-            raise Sobrecarga(f"HTTP {resp.status_code} em {host}")
-        if SOBRECARGA.search(resp.text[:20000]):
-            raise Sobrecarga(f"aviso de excesso de consultas em {host}")
-        return resp
 
 
 def estado(html: str) -> str:
@@ -170,7 +102,6 @@ def consulta_numero(
     numero: str,
     *,
     grau: int = 1,
-    tentativas: int = TENTATIVAS,
     contagem: dict | None = None,
     log: Callable[[str], None] = lambda _m: None,
 ) -> dict | None:
@@ -183,14 +114,16 @@ def consulta_numero(
     url = url_consulta(tribunal, grau)
     c = contagem if contagem is not None else {}
     recusas = 0
-    for n in range(tentativas):
-        s = SessaoEspacada(espera=ESPERA * 2 ** min(recusas, 4)) if recusas else SessaoEspacada()
+    for n in range(TENTATIVAS):
+        # Sessão nova a cada captcha: o captcha fica preso ao PHPSESSID. O
+        # intervalo do host é do ritmo e sobrevive à troca de sessão.
+        s = SessaoRitmada()
         try:
             pagina = s.get(url)
         except Sobrecarga as exc:
             recusas += 1
             log(f"eproc: tentativa {n + 1}: {exc}")
-            if recusas > 4:
+            if recusas >= RECUSAS_SEGUIDAS:
                 raise
             continue
         recusas = 0
@@ -204,17 +137,24 @@ def consulta_numero(
             log(f"eproc: tentativa {n + 1}: palpite {lido!r} ({conf}) abaixo do limiar")
             continue
         form = BeautifulSoup(pagina.text, "html.parser").find("form")
-        resp = s.post(urljoin(pagina.url, form.get("action")),
-                      data=build_search_payload(pagina.text, numero, texto))
+        try:
+            resp = s.post(urljoin(pagina.url, form.get("action")),
+                          data=build_search_payload(pagina.text, numero, texto))
+        except Sobrecarga as exc:
+            recusas += 1
+            log(f"eproc: tentativa {n + 1}: {exc} no envio")
+            if recusas >= RECUSAS_SEGUIDAS:
+                raise
+            continue
         c["enviados"] = c.get("enviados", 0) + 1
         e = estado(resp.text)
         if e == "recusa":
-            ocr.registrar("eproc", png, texto, conf, False)
+            ocr.registrar("eproc", png, texto, conf, aceito=False)
             continue
         if e == "outro":
             log(f"eproc: tentativa {n + 1}: resposta inesperada (HTTP {resp.status_code}, {resp.url[:120]})")
             continue
-        ocr.registrar("eproc", png, texto, conf, True)
+        ocr.registrar("eproc", png, texto, conf, aceito=True)
         c["aceitos"] = c.get("aceitos", 0) + 1
         return {"estado": e, "texto": resp.text, "url": resp.url, "sessao": s}
     return None
