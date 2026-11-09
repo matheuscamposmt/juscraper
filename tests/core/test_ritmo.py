@@ -52,3 +52,14 @@ def test_aviso_de_excesso_na_pagina_conta_como_recusa():
     responses.add(responses.GET, URL, body="Foram identificadas multiplas consultas simultâneas", status=200)
     with pytest.raises(ritmo.Sobrecarga):
         ritmo.SessaoRitmada(piso=0.5).get(URL)
+
+
+@responses.activate
+def test_aviso_de_excesso_no_meio_de_pagina_grande_conta_como_recusa():
+    # No e-SAJ do TJAL (09/11/2026) o aviso vem no caractere 24.019 de uma
+    # página de 46 KB, depois do cabeçalho e dos scripts do portal.
+    corpo = "<script>" + "x" * 24000 + "</script> Foram identificadas multiplas consultas simultâneas"
+    responses.add(responses.GET, URL, body=corpo, status=200)
+    with pytest.raises(ritmo.Sobrecarga):
+        ritmo.SessaoRitmada(piso=0.5).get(URL)
+    assert ritmo.estado("eproc1g.tjxx.jus.br", piso=0.5)[1] == ritmo.RECUSA_MINIMA

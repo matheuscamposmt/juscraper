@@ -116,6 +116,19 @@ def vez(host: str, piso: float = PISO) -> Iterator[dict]:
             fcntl.flock(fh, fcntl.LOCK_UN)
 
 
+JANELA_DO_AVISO = 200_000
+"""Caracteres da página em que se procura o aviso de excesso. No e-SAJ do TJAL
+(09/11/2026) o aviso vem no caractere 24.019, depois do cabeçalho do portal."""
+
+
+def _tem_aviso(resp: requests.Response) -> bool:
+    """Aviso de excesso numa resposta de texto (HTML, JSON); binário não é lido."""
+    tipo = resp.headers.get("Content-Type", "").lower()
+    if tipo and not any(t in tipo for t in ("text", "html", "json", "xml")):
+        return False
+    return bool(AVISO_DE_EXCESSO.search(resp.text[:JANELA_DO_AVISO]))
+
+
 class SessaoRitmada(requests.Session):
     """``requests.Session`` que segue :func:`vez` em toda requisição.
 
@@ -145,7 +158,7 @@ class SessaoRitmada(requests.Session):
             if resp.status_code in (403, 429) or resp.status_code >= 500:
                 motivo = f"HTTP {resp.status_code} em {host}"
                 r["retry_after"] = retry_after(resp.headers.get("Retry-After"))
-            elif AVISO_DE_EXCESSO.search(resp.text[:20000]):
+            elif _tem_aviso(resp):
                 motivo = f"aviso de excesso de consultas em {host}"
             r["ok"] = motivo is None
         if motivo:
