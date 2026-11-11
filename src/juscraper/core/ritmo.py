@@ -57,6 +57,16 @@ USER_AGENT = (
 )
 
 
+PARAR = threading.Event()
+"""Quem usa o ritmo seta no sinal de parada: a espera da vez acorda na hora e
+levanta ``Interrompido``. Sem isso, um intervalo alto (até ``TETO``) segurava o
+processo dormindo e o gerenciador de serviços o matava sem gravar nada."""
+
+
+class Interrompido(Exception):
+    """Parada pedida (``PARAR``) enquanto se esperava a vez do host."""
+
+
 class Sobrecarga(Exception):
     """O servidor recusou pelo volume (403, 429, 5xx, aviso na página ou erro de rede)."""
 
@@ -108,8 +118,8 @@ def vez(host: str, piso: float = PISO) -> Iterator[dict]:
                 ultimo, intervalo = 0.0, piso
             intervalo = max(piso, intervalo)
             falta = ultimo + intervalo - time.time()
-            if falta > 0:
-                time.sleep(falta)
+            if falta > 0 and PARAR.wait(falta):
+                raise Interrompido(f"parada pedida durante a espera de {host}")
             resultado: dict = {"ok": False, "retry_after": None, "intervalo": intervalo}
             try:
                 yield resultado

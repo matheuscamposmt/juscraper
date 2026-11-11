@@ -11,6 +11,8 @@ URL = "https://eproc1g.tjxx.jus.br/eproc/externo_controlador.php"
 def _pasta_do_ritmo(tmp_path, monkeypatch, mocker):
     monkeypatch.setenv("JUSCRAPER_RITMO_DIR", str(tmp_path))
     mocker.patch("time.sleep")
+    ritmo.PARAR.clear()
+    mocker.patch.object(ritmo.PARAR, "wait", return_value=False)
 
 
 def test_resposta_boa_encolhe_ate_o_piso():
@@ -88,3 +90,13 @@ def test_sem_variavel_nao_grava(tmp_path, monkeypatch):
     monkeypatch.delenv("JUSCRAPER_RITMO_LOG", raising=False)
     ritmo._registra("x.jus.br", 0.1, True, 0.5)
     assert not list(tmp_path.glob("*.log"))
+
+
+def test_parada_acorda_a_espera_e_levanta(mocker):
+    mocker.patch.object(ritmo.PARAR, "wait", return_value=True)  # o sinal chegou durante a espera
+    ritmo._arquivo("h.example").write_text(f"{__import__('time').time()} 900.0")
+    with pytest.raises(ritmo.Interrompido):
+        with ritmo.vez("h.example"):
+            pass
+    ritmo.PARAR.wait.assert_called_once()
+    assert ritmo.PARAR.wait.call_args.args[0] > 800  # esperava o intervalo de 900 s, não dormiu
