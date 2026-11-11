@@ -102,13 +102,40 @@ def _dir(perfil) -> Path:
     return d
 
 
+_contagem: dict = {}
+"""Arquivos em cada pasta de rotulados, contados uma vez por processo."""
+
+
+def _grava_rotulado(pasta: Path, h: str) -> bool:
+    """Se o exemplo rotulado vai para o disco.
+
+    ``JUSCRAPER_CAPTCHA_MAX_ROTULADOS``: teto de arquivos na pasta (0 ou ausente:
+    sem teto). ``JUSCRAPER_CAPTCHA_AMOSTRA=N``: grava 1 em N, escolhido pelo
+    hash da imagem. O ``registro.jsonl`` guarda todos os resultados de qualquer
+    forma; o teto só limita as imagens, que crescem com a coleta.
+    """
+    n = int(os.environ.get("JUSCRAPER_CAPTCHA_AMOSTRA") or 1)
+    if n > 1 and int(h, 16) % n:
+        return False
+    teto = int(os.environ.get("JUSCRAPER_CAPTCHA_MAX_ROTULADOS") or 0)
+    if not teto:
+        return True
+    if pasta not in _contagem:
+        _contagem[pasta] = sum(1 for _ in pasta.iterdir()) if pasta.exists() else 0
+    return _contagem[pasta] < teto
+
+
 def registrar(perfil, imagem: bytes, texto, conf, aceito):
     """Grava o resultado. Captcha aceito vira exemplo rotulado (imagem + texto certo)."""
     d = _dir(perfil)
     h = hashlib.sha1(imagem).hexdigest()[:12]
-    if aceito:
-        (d / "rotulados").mkdir(exist_ok=True)
-        (d / "rotulados" / f"{texto}_{h}.png").write_bytes(imagem)
+    pasta = d / "rotulados"
+    if aceito and _grava_rotulado(pasta, h):
+        pasta.mkdir(exist_ok=True)
+        arq = pasta / f"{texto}_{h}.png"
+        if not arq.exists():
+            arq.write_bytes(imagem)
+            _contagem[pasta] = _contagem.get(pasta, 0) + 1
     with open(d / "registro.jsonl", "a") as fh:
         fh.write(json.dumps({"t": round(time.time(), 1), "img": h, "texto": texto, "conf": conf,
                              "aceito": aceito}, ensure_ascii=False) + "\n")
