@@ -97,7 +97,50 @@ def decodifica_sem_caixa(probabilidades, charset, permitidos):
     return texto, round(conf, 3)
 
 
-def ler(imagem: bytes, perfil="generico"):
+def sem_saturados(png: bytes, limiar: int = 100, brilho: int = 200) -> bytes:
+    """Pinta de branco os pixels saturados e claros (HSV do OpenCV, 0 a 255).
+
+    No Eproc o texto vem escuro e de cor solida e as linhas de ruido em cores
+    saturadas e claras. Pixel escuro tem saturacao instavel no HSV, por isso
+    o corte exige tambem brilho alto. A imagem continua colorida.
+    """
+    import cv2
+    import numpy as np
+    img = cv2.imdecode(np.frombuffer(png, np.uint8), cv2.IMREAD_COLOR)
+    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+    img[(hsv[..., 1] > limiar) & (hsv[..., 2] > brilho)] = 255
+    return cv2.imencode(".png", img)[1].tobytes()
+
+
+def renormaliza(probabilidades, charset, permitidos):
+    """Probabilidade de cada posicao dividida pela soma das classes permitidas e do branco."""
+    idx = [i for i, c in enumerate(charset) if c == "" or c in permitidos]
+    out = []
+    for linha in probabilidades:
+        while linha and isinstance(linha[0], list):
+            linha = linha[0]
+        soma = sum(linha[i] for i in idx) or 1.0
+        nova = [0.0] * len(linha)
+        for i in idx:
+            nova[i] = linha[i] / soma
+        out.append(nova)
+    return out
+
+
+_OCR_FAIXA = None
+
+
+def _ocr_faixa(alfabeto):
+    """Outra instancia do ddddocr com o charset_range do proprio pacote (descarta, depois do argmax, o resto)."""
+    global _OCR_FAIXA
+    if _OCR_FAIXA is None:
+        import ddddocr
+        _OCR_FAIXA = ddddocr.DdddOcr(show_ad=False)
+        _OCR_FAIXA.set_ranges(alfabeto)
+    return _OCR_FAIXA
+
+
+def ler(imagem: bytes, perfil="generico", renorm=False):
     """(texto, confianca) do OCR, restrito ao alfabeto do perfil."""
     p = PERFIS[perfil]
     r = _ocr().classification(imagem, probability=True)
@@ -106,7 +149,41 @@ def ler(imagem: bytes, perfil="generico"):
     probs = r["probabilities"] if "probabilities" in r else r["probability"]
     charset = r["charset"] if "charset" in r else r["charsets"]
     dec = decodifica if p.get("caixa", True) else decodifica_sem_caixa
+    if renorm:
+        probs = renormaliza(probs, charset, set(p["alfabeto"]))
     return dec(probs, charset, set(p["alfabeto"]))
+
+
+VARIANTES = ("atual", "dessat", "renorm", "range")
+"""Leituras do teste A/B (JUSCRAPER_CAPTCHA_AB="atual,dessat,renorm,range"), alternadas por captcha:
+
+* atual: a leitura do perfil e o limiar;
+* dessat: a atual; se nao passa, le de novo sem as linhas saturadas (sem requisicao a mais);
+* renorm: confianca renormalizada sobre o alfabeto, mesmo limiar;
+* range: o texto do ddddocr com charset_range; envia se tiver o tamanho do perfil.
+"""
+_ab = {"n": 0, "ultima": None}
+
+
+def _passa(p, texto, conf):
+    return p["tamanho"][0] <= len(texto) <= p["tamanho"][1] and conf >= p["limiar"]
+
+
+def _le_variante(imagem, perfil, v):
+    p = PERFIS[perfil]
+    if v == "renorm":
+        return ler(imagem, perfil, renorm=True)
+    if v == "range":
+        texto = _ocr_faixa(p["alfabeto"]).classification(imagem)
+        if not p.get("caixa", True):
+            texto = texto.lower()
+        return texto, 1.0
+    texto, conf = ler(imagem, perfil)
+    if v == "dessat" and not _passa(p, texto, conf):
+        t2, c2 = ler(sem_saturados(imagem), perfil)
+        if _passa(p, t2, c2):
+            return t2, c2
+    return texto, conf
 
 
 def resolver(imagem: bytes, perfil="generico"):
@@ -115,9 +192,17 @@ def resolver(imagem: bytes, perfil="generico"):
     None quer dizer "nao envie, peca outro captcha", como o
     ERROR_CAPTCHA_UNSOLVABLE do CapMonster abaixo do recognizingThreshold.
     """
-    texto, conf = ler(imagem, perfil)
+    ab = [x for x in (os.environ.get("JUSCRAPER_CAPTCHA_AB") or "").split(",") if x in VARIANTES]
+    if ab:
+        v = ab[_ab["n"] % len(ab)]
+        _ab["n"] += 1
+        _ab["ultima"] = v
+        texto, conf = _le_variante(imagem, perfil, v)
+    else:
+        _ab["ultima"] = None
+        texto, conf = ler(imagem, perfil)
     p = PERFIS[perfil]
-    if not (p["tamanho"][0] <= len(texto) <= p["tamanho"][1]) or conf < p["limiar"]:
+    if not _passa(p, texto, conf):
         return None, texto, conf
     return texto, texto, conf
 
@@ -172,8 +257,10 @@ def registrar(perfil, imagem: bytes, texto, conf, aceito):
             _contagem[pasta] = _contagem.get(pasta, 0) + 1
             _gravados[pasta] = _gravados.get(pasta, 0) + 1
     with open(d / "registro.jsonl", "a") as fh:
-        fh.write(json.dumps({"t": round(time.time(), 1), "img": h, "texto": texto, "conf": conf,
-                             "aceito": aceito}, ensure_ascii=False) + "\n")
+        linha = {"t": round(time.time(), 1), "img": h, "texto": texto, "conf": conf, "aceito": aceito}
+        if _ab["ultima"]:
+            linha["variante"] = _ab["ultima"]
+        fh.write(json.dumps(linha, ensure_ascii=False) + "\n")
 
 
 def estatisticas(perfil) -> dict:

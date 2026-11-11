@@ -28,6 +28,7 @@ da AWS:
 from __future__ import annotations
 
 import base64
+import os
 import re
 from collections.abc import Callable
 from urllib.parse import urljoin
@@ -134,6 +135,8 @@ def consulta_numero(
             return None
         texto, lido, conf = ocr.resolver(png, "eproc")
         if texto is None:
+            if os.environ.get("JUSCRAPER_CAPTCHA_AB"):  # no teste A/B, o descarte também conta
+                ocr.registrar("eproc", png, lido, conf, aceito=None)
             log(f"eproc: tentativa {n + 1}: palpite {lido!r} ({conf}) abaixo do limiar")
             continue
         form = BeautifulSoup(pagina.text, "html.parser").find("form")
