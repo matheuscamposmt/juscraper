@@ -137,7 +137,7 @@ _MEDIDAS: dict[str, dict] = {}
 _TRAVA_MEDIDAS = threading.Lock()
 
 
-def _registra(host: str, latencia: float, ok: bool, intervalo: float) -> None:
+def _registra(host: str, latencia: float, *, ok: bool, intervalo: float) -> None:
     """Acumula a medida do host e grava a linha da janela em ``JUSCRAPER_RITMO_LOG``, se definido."""
     arq = os.environ.get("JUSCRAPER_RITMO_LOG")
     if not arq:
@@ -158,7 +158,7 @@ def _registra(host: str, latencia: float, ok: bool, intervalo: float) -> None:
                  "intervalo": round(intervalo, 3)}
         del _MEDIDAS[host]
     try:
-        with open(arq, "a", encoding="utf-8") as fh:
+        with Path(arq).open("a", encoding="utf-8") as fh:
             fh.write(json.dumps(linha) + "\n")
     except OSError:
         pass
@@ -202,7 +202,7 @@ class SessaoRitmada(requests.Session):
             try:
                 resp = super().request(method, url, *args, **kwargs)
             except (requests.ConnectionError, requests.Timeout) as exc:
-                _registra(host, time.monotonic() - inicio, False, r["intervalo"])
+                _registra(host, time.monotonic() - inicio, ok=False, intervalo=r["intervalo"])
                 raise Sobrecarga(f"{type(exc).__name__} em {host}") from exc
             motivo = None
             if resp.status_code in (403, 429) or resp.status_code >= 500:
@@ -211,7 +211,7 @@ class SessaoRitmada(requests.Session):
             elif _tem_aviso(resp):
                 motivo = f"aviso de excesso de consultas em {host}"
             r["ok"] = motivo is None
-            _registra(host, time.monotonic() - inicio, r["ok"], r["intervalo"])
+            _registra(host, time.monotonic() - inicio, ok=r["ok"], intervalo=r["intervalo"])
         if motivo:
             raise Sobrecarga(motivo)
         return resp

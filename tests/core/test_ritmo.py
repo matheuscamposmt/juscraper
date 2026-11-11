@@ -1,4 +1,6 @@
 """Ritmo adaptativo por host: o intervalo encolhe na resposta boa e dobra na recusa."""
+import json
+
 import pytest
 import responses
 
@@ -69,11 +71,10 @@ def test_aviso_de_excesso_no_meio_de_pagina_grande_conta_como_recusa():
 
 @responses.activate
 def test_registro_de_medidas_por_host(tmp_path, monkeypatch):
-    import json
     arq = tmp_path / "ritmo.log"
     monkeypatch.setenv("JUSCRAPER_RITMO_LOG", str(arq))
     monkeypatch.setenv("JUSCRAPER_RITMO_JANELA", "0")
-    ritmo._MEDIDAS.clear()
+    monkeypatch.setattr(ritmo, "_MEDIDAS", {})
     responses.add(responses.GET, URL, body="ok", status=200)
     responses.add(responses.GET, URL, status=503)
     sessao = ritmo.SessaoRitmada(piso=0.5)
@@ -86,17 +87,20 @@ def test_registro_de_medidas_por_host(tmp_path, monkeypatch):
     assert linhas[1]["intervalo"] == 0.5
 
 
+@responses.activate
 def test_sem_variavel_nao_grava(tmp_path, monkeypatch):
     monkeypatch.delenv("JUSCRAPER_RITMO_LOG", raising=False)
-    ritmo._registra("x.jus.br", 0.1, True, 0.5)
+    monkeypatch.setenv("JUSCRAPER_RITMO_JANELA", "0")
+    responses.add(responses.GET, URL, body="ok", status=200)
+    ritmo.SessaoRitmada(piso=0.5).get(URL)
     assert not list(tmp_path.glob("*.log"))
 
 
 def test_parada_acorda_a_espera_e_levanta(mocker):
-    mocker.patch.object(ritmo.PARAR, "wait", return_value=True)  # o sinal chegou durante a espera
-    ritmo._arquivo("h.example").write_text(f"{__import__('time').time()} 900.0")
-    with pytest.raises(ritmo.Interrompido):
-        with ritmo.vez("h.example"):
-            pass
-    ritmo.PARAR.wait.assert_called_once()
-    assert ritmo.PARAR.wait.call_args.args[0] > 800  # esperava o intervalo de 900 s, não dormiu
+    with ritmo.vez("h.example") as r:  # uma recusa com Retry-After de 900 s
+        r["retry_after"] = 900.0
+    espera = mocker.patch.object(ritmo.PARAR, "wait", return_value=True)  # o sinal chegou durante a espera
+    with pytest.raises(ritmo.Interrompido), ritmo.vez("h.example"):
+        pass
+    espera.assert_called_once()
+    assert espera.call_args.args[0] > 800  # esperava o intervalo de 900 s, não dormiu
