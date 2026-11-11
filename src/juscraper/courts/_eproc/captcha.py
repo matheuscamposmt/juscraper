@@ -33,7 +33,10 @@ ALNUM = string.ascii_letters + string.digits
 
 PERFIS = {
     # Eproc (TJPR, TJSC, TJRS, TRF4...): 4 caracteres, letras e numeros, com linhas de ruido.
-    "eproc": {"alfabeto": ALNUM, "tamanho": (4, 4), "limiar": 0.40},
+    # O site nao diferencia caixa: medido em 11/11/2026 no TJPR, 8 de 8 palpites
+    # enviados com a caixa trocada ("b99b" como "B99B") foram aceitos. Por isso
+    # a leitura soma "c" e "C" numa classe so ("caixa": False).
+    "eproc": {"alfabeto": ALNUM, "tamanho": (4, 4), "limiar": 0.40, "caixa": False},
     # Generico: sem saber o site, aceita de 3 a 8 caracteres.
     "generico": {"alfabeto": ALNUM, "tamanho": (3, 8), "limiar": 0.50},
 }
@@ -69,6 +72,31 @@ def decodifica(probabilidades, charset, permitidos):
     return texto, round(conf, 3)
 
 
+def decodifica_sem_caixa(probabilidades, charset, permitidos):
+    """Como :func:`decodifica`, mas maiuscula e minuscula sao uma classe so.
+
+    Em cada posicao soma a probabilidade das duas caixas de cada letra. O
+    texto sai em minusculas; a confianca e a menor probabilidade (da classe)
+    entre os caracteres escolhidos. Medido em 3.000 rotulados do Eproc: a
+    confianca mediana sobe de 0,62 para 0,85.
+    """
+    classes: dict = {}
+    for i, c in enumerate(charset):
+        if c == "" or c in permitidos:
+            classes.setdefault(c.lower(), []).append(i)
+    texto, anterior, conf = "", None, 1.0
+    for linha in probabilidades:
+        while linha and isinstance(linha[0], list):
+            linha = linha[0]
+        soma = {k: sum(linha[i] for i in ix) for k, ix in classes.items()}
+        k = max(soma, key=soma.get)
+        if k and k != anterior:
+            texto += k
+            conf = min(conf, soma[k])
+        anterior = k
+    return texto, round(conf, 3)
+
+
 def ler(imagem: bytes, perfil="generico"):
     """(texto, confianca) do OCR, restrito ao alfabeto do perfil."""
     p = PERFIS[perfil]
@@ -77,7 +105,8 @@ def ler(imagem: bytes, perfil="generico"):
     # Python 3.9 da VM, devolve "charsets"/"probability".
     probs = r["probabilities"] if "probabilities" in r else r["probability"]
     charset = r["charset"] if "charset" in r else r["charsets"]
-    return decodifica(probs, charset, set(p["alfabeto"]))
+    dec = decodifica if p.get("caixa", True) else decodifica_sem_caixa
+    return dec(probs, charset, set(p["alfabeto"]))
 
 
 def resolver(imagem: bytes, perfil="generico"):
