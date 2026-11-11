@@ -103,7 +103,11 @@ def _dir(perfil) -> Path:
 
 
 _contagem: dict = {}
-"""Arquivos em cada pasta de rotulados, contados uma vez por processo."""
+"""Arquivos em cada pasta de rotulados, contados no disco e somados a cada gravação."""
+_gravados: dict = {}
+"""Gravações deste processo desde a última contagem no disco, por pasta."""
+RECONTA = 100
+"""A cada tantas gravações, reconta a pasta: outros processos podem gravar nela."""
 
 
 def _grava_rotulado(pasta: Path, h: str) -> bool:
@@ -120,8 +124,9 @@ def _grava_rotulado(pasta: Path, h: str) -> bool:
     teto = int(os.environ.get("JUSCRAPER_CAPTCHA_MAX_ROTULADOS") or 0)
     if not teto:
         return True
-    if pasta not in _contagem:
+    if pasta not in _contagem or _gravados.get(pasta, 0) >= RECONTA:
         _contagem[pasta] = sum(1 for _ in pasta.iterdir()) if pasta.exists() else 0
+        _gravados[pasta] = 0
     return _contagem[pasta] < teto
 
 
@@ -136,6 +141,7 @@ def registrar(perfil, imagem: bytes, texto, conf, aceito):
         if not arq.exists():
             arq.write_bytes(imagem)
             _contagem[pasta] = _contagem.get(pasta, 0) + 1
+            _gravados[pasta] = _gravados.get(pasta, 0) + 1
     with open(d / "registro.jsonl", "a") as fh:
         fh.write(json.dumps({"t": round(time.time(), 1), "img": h, "texto": texto, "conf": conf,
                              "aceito": aceito}, ensure_ascii=False) + "\n")

@@ -12,6 +12,7 @@ def _pasta(tmp_path, monkeypatch):
     monkeypatch.delenv("JUSCRAPER_CAPTCHA_MAX_ROTULADOS", raising=False)
     monkeypatch.delenv("JUSCRAPER_CAPTCHA_AMOSTRA", raising=False)
     captcha._contagem.clear()
+    captcha._gravados.clear()
     return tmp_path
 
 
@@ -44,6 +45,19 @@ def test_teto_conta_o_que_ja_existe_no_disco(_pasta, monkeypatch):
     monkeypatch.setenv("JUSCRAPER_CAPTCHA_MAX_ROTULADOS", "3")
     captcha.registrar("eproc", b"nova", "abcd", 0.9, aceito=True)
     assert len(_rotulados(_pasta)) == 3
+
+
+def test_teto_vale_entre_processos(_pasta, monkeypatch):
+    """Outro processo gravando na mesma pasta: a recontagem periódica segura o teto."""
+    monkeypatch.setenv("JUSCRAPER_CAPTCHA_MAX_ROTULADOS", "5")
+    monkeypatch.setattr(captcha, "RECONTA", 2)
+    captcha.registrar("eproc", b"a", "aaaa", 0.9, aceito=True)
+    d = _pasta / "eproc" / "rotulados"
+    for i in range(6):  # o outro processo
+        (d / f"x{i}_0.png").write_bytes(b"x")
+    for i in range(5):
+        captcha.registrar("eproc", f"img{i}".encode(), f"ab{i}c", 0.9, aceito=True)
+    assert len(_rotulados(_pasta)) <= 7 + 1  # 1 próprio + 6 alheios + no máximo RECONTA - 1 antes de recontar
 
 
 def test_amostra_grava_uma_parte(_pasta, monkeypatch):
