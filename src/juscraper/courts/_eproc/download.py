@@ -16,7 +16,7 @@ aviso de excesso) e encolhe a cada resposta boa. :class:`Sobrecarga` sobe
 para quem chama depois de ``RECUSAS_SEGUIDAS`` recusas.
 
 Tipo de captcha por tribunal, medido em 09/11/2026 por GET a partir de um IP
-da AWS:
+de datacenter:
 
 | Captcha                    | Tribunais                                     |
 |----------------------------|-----------------------------------------------|
@@ -33,6 +33,7 @@ import re
 from collections.abc import Callable
 from urllib.parse import urljoin
 
+import requests
 from bs4 import BeautifulSoup
 
 from juscraper.core.ritmo import SessaoRitmada, Sobrecarga
@@ -98,6 +99,64 @@ def extrai_captcha(form_html: str) -> bytes | None:
     return base64.b64decode(img["src"].split(",", 1)[1]) if img else None
 
 
+def _conta_recusa(recusas: int, exc: Sobrecarga, log: Callable[[str], None], mensagem: str) -> int:
+    """Soma uma recusa por volume e a registra no ``log``.
+
+    Args:
+        recusas: recusas seguidas até aqui.
+        exc: a recusa.
+        log: destino da ``mensagem``.
+        mensagem: texto para o ``log``.
+
+    Returns:
+        As recusas seguidas, contando esta.
+
+    Raises:
+        Sobrecarga: ``exc``, quando as recusas seguidas chegam a ``RECUSAS_SEGUIDAS``.
+    """
+    recusas += 1
+    log(mensagem)
+    if recusas >= RECUSAS_SEGUIDAS:
+        raise exc
+    return recusas
+
+
+def _palpite(png: bytes, n: int, log: Callable[[str], None]) -> tuple[str, float] | None:
+    """Texto e confiança do OCR, ou ``None`` se o palpite não passa no limiar do perfil."""
+    texto, lido, conf = ocr.resolver(png, "eproc")
+    if texto is None:
+        if os.environ.get("JUSCRAPER_CAPTCHA_AB"):  # no teste A/B, o descarte também conta
+            ocr.registrar("eproc", png, lido, conf, aceito=None)
+        log(f"eproc: tentativa {n + 1}: palpite {lido!r} ({conf}) abaixo do limiar")
+        return None
+    return texto, conf
+
+
+def _envia(s: SessaoRitmada, pagina: requests.Response, numero: str, texto: str) -> requests.Response:
+    """``POST`` do formulário da página, no host final do ``GET``, com o número e o captcha."""
+    form = BeautifulSoup(pagina.text, "html.parser").find("form")
+    return s.post(urljoin(pagina.url, form.get("action")),
+                  data=build_search_payload(pagina.text, numero, texto))
+
+
+def _aceita(resp: requests.Response, png: bytes, palpite: tuple[str, float], n: int,
+            log: Callable[[str], None]) -> str | None:
+    """Estado da resposta se o site processou o formulário; ``None`` para tentar de novo.
+
+    Registra o captcha como aceito ou recusado; a resposta inesperada não entra no registro.
+    """
+    texto, conf = palpite
+    e = estado(resp.text)
+    if e == "recusa":
+        ocr.registrar("eproc", png, texto, conf, aceito=False)
+        return None
+    if e == "outro":
+        log(f"eproc: tentativa {n + 1}: resposta inesperada (HTTP {resp.status_code}, {resp.url[:120]})")
+        return None
+    ocr.registrar("eproc", png, texto, conf, aceito=True)
+    return e
+
+
 def consulta_numero(
     tribunal: str,
     numero: str,
@@ -111,6 +170,9 @@ def consulta_numero(
     O retorno tem ``estado`` (``capa``, ``nada`` ou ``lista``), ``texto``,
     ``url`` e ``sessao``. ``contagem`` soma captchas pedidos, enviados e
     aceitos.
+
+    Raises:
+        Sobrecarga: depois de ``RECUSAS_SEGUIDAS`` recusas por volume seguidas.
     """
     url = url_consulta(tribunal, grau)
     c = contagem if contagem is not None else {}
@@ -122,10 +184,7 @@ def consulta_numero(
         try:
             pagina = s.get(url)
         except Sobrecarga as exc:
-            recusas += 1
-            log(f"eproc: tentativa {n + 1}: {exc}")
-            if recusas >= RECUSAS_SEGUIDAS:
-                raise
+            recusas = _conta_recusa(recusas, exc, log, f"eproc: tentativa {n + 1}: {exc}")
             continue
         recusas = 0
         c["captchas"] = c.get("captchas", 0) + 1
@@ -133,31 +192,18 @@ def consulta_numero(
         if png is None:
             log(f"eproc: página sem captcha de imagem (HTTP {pagina.status_code})")
             return None
-        texto, lido, conf = ocr.resolver(png, "eproc")
-        if texto is None:
-            if os.environ.get("JUSCRAPER_CAPTCHA_AB"):  # no teste A/B, o descarte também conta
-                ocr.registrar("eproc", png, lido, conf, aceito=None)
-            log(f"eproc: tentativa {n + 1}: palpite {lido!r} ({conf}) abaixo do limiar")
+        palpite = _palpite(png, n, log)
+        if palpite is None:
             continue
-        form = BeautifulSoup(pagina.text, "html.parser").find("form")
         try:
-            resp = s.post(urljoin(pagina.url, form.get("action")),
-                          data=build_search_payload(pagina.text, numero, texto))
+            resp = _envia(s, pagina, numero, palpite[0])
         except Sobrecarga as exc:
-            recusas += 1
-            log(f"eproc: tentativa {n + 1}: {exc} no envio")
-            if recusas >= RECUSAS_SEGUIDAS:
-                raise
+            recusas = _conta_recusa(recusas, exc, log, f"eproc: tentativa {n + 1}: {exc} no envio")
             continue
         c["enviados"] = c.get("enviados", 0) + 1
-        e = estado(resp.text)
-        if e == "recusa":
-            ocr.registrar("eproc", png, texto, conf, aceito=False)
+        e = _aceita(resp, png, palpite, n, log)
+        if e is None:
             continue
-        if e == "outro":
-            log(f"eproc: tentativa {n + 1}: resposta inesperada (HTTP {resp.status_code}, {resp.url[:120]})")
-            continue
-        ocr.registrar("eproc", png, texto, conf, aceito=True)
         c["aceitos"] = c.get("aceitos", 0) + 1
         return {"estado": e, "texto": resp.text, "url": resp.url, "sessao": s}
     return None

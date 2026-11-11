@@ -1,8 +1,8 @@
 """Família Eproc: consulta pública de processo (capa) com captcha de imagem.
 
 Experimental. Ainda não segue o contrato de ``CONTRIBUTING.md`` (samples
-capturados, testes de contrato, schema, CHANGELOG): é a base que este branch
-vai formalizar.
+capturados, testes de contrato, schema): é a base que este branch vai
+formalizar.
 
 Módulos:
 
