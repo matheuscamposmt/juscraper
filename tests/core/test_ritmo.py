@@ -63,3 +63,28 @@ def test_aviso_de_excesso_no_meio_de_pagina_grande_conta_como_recusa():
     with pytest.raises(ritmo.Sobrecarga):
         ritmo.SessaoRitmada(piso=0.5).get(URL)
     assert ritmo.estado("eproc1g.tjxx.jus.br", piso=0.5)[1] == ritmo.RECUSA_MINIMA
+
+
+@responses.activate
+def test_registro_de_medidas_por_host(tmp_path, monkeypatch):
+    import json
+    arq = tmp_path / "ritmo.log"
+    monkeypatch.setenv("JUSCRAPER_RITMO_LOG", str(arq))
+    monkeypatch.setenv("JUSCRAPER_RITMO_JANELA", "0")
+    ritmo._MEDIDAS.clear()
+    responses.add(responses.GET, URL, body="ok", status=200)
+    responses.add(responses.GET, URL, status=503)
+    sessao = ritmo.SessaoRitmada(piso=0.5)
+    sessao.get(URL)
+    with pytest.raises(ritmo.Sobrecarga):
+        sessao.get(URL)
+    linhas = [json.loads(x) for x in arq.read_text().splitlines()]
+    assert [x["recusas"] for x in linhas] == [0, 1]
+    assert all(x["host"] == "eproc1g.tjxx.jus.br" and x["n"] == 1 for x in linhas)
+    assert linhas[1]["intervalo"] == 0.5
+
+
+def test_sem_variavel_nao_grava(tmp_path, monkeypatch):
+    monkeypatch.delenv("JUSCRAPER_RITMO_LOG", raising=False)
+    ritmo._registra("x.jus.br", 0.1, True, 0.5)
+    assert not list(tmp_path.glob("*.log"))

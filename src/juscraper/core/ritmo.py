@@ -16,13 +16,20 @@ servidor:
 O estado de cada host (fim da última resposta e intervalo atual) fica num
 arquivo em ``JUSCRAPER_RITMO_DIR`` (padrão: o diretório temporário do sistema). Ler o arquivo mostra o
 intervalo que o tribunal está aceitando agora.
+
+Com ``JUSCRAPER_RITMO_LOG`` apontando para um arquivo, cada processo grava ali,
+a cada ``JUSCRAPER_RITMO_JANELA`` segundos (padrão 300) e por host, uma linha
+JSON com o número de requisições, as recusas, a latência mediana e a do
+percentil 90 e o intervalo em uso. Serve para medir o efeito de mudar o piso.
 """
 from __future__ import annotations
 
 import fcntl
+import json
 import os
 import re
 import tempfile
+import threading
 import time
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -103,7 +110,7 @@ def vez(host: str, piso: float = PISO) -> Iterator[dict]:
             falta = ultimo + intervalo - time.time()
             if falta > 0:
                 time.sleep(falta)
-            resultado: dict = {"ok": False, "retry_after": None}
+            resultado: dict = {"ok": False, "retry_after": None, "intervalo": intervalo}
             try:
                 yield resultado
             finally:
@@ -114,6 +121,37 @@ def vez(host: str, piso: float = PISO) -> Iterator[dict]:
                 fh.flush()
         finally:
             fcntl.flock(fh, fcntl.LOCK_UN)
+
+
+_MEDIDAS: dict[str, dict] = {}
+_TRAVA_MEDIDAS = threading.Lock()
+
+
+def _registra(host: str, latencia: float, ok: bool, intervalo: float) -> None:
+    """Acumula a medida do host e grava a linha da janela em ``JUSCRAPER_RITMO_LOG``, se definido."""
+    arq = os.environ.get("JUSCRAPER_RITMO_LOG")
+    if not arq:
+        return
+    janela = float(os.environ.get("JUSCRAPER_RITMO_JANELA", "300"))
+    agora = time.time()
+    with _TRAVA_MEDIDAS:
+        m = _MEDIDAS.setdefault(host, {"inicio": agora, "lat": [], "recusas": 0})
+        m["lat"].append(latencia)
+        m["recusas"] += not ok
+        if agora - m["inicio"] < janela:
+            return
+        lat = sorted(m["lat"])
+        linha = {"t": time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(agora)), "host": host,
+                 "pid": os.getpid(), "segundos": round(agora - m["inicio"]), "n": len(lat),
+                 "recusas": m["recusas"], "lat_mediana": round(lat[len(lat) // 2], 3),
+                 "lat_p90": round(lat[min(len(lat) - 1, int(len(lat) * 0.9))], 3),
+                 "intervalo": round(intervalo, 3)}
+        del _MEDIDAS[host]
+    try:
+        with open(arq, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(linha) + "\n")
+    except OSError:
+        pass
 
 
 JANELA_DO_AVISO = 200_000
@@ -150,9 +188,11 @@ class SessaoRitmada(requests.Session):
         host = urlparse(url).netloc
         kwargs.setdefault("timeout", 60)
         with vez(host, self.piso) as r:
+            inicio = time.monotonic()
             try:
                 resp = super().request(method, url, *args, **kwargs)
             except (requests.ConnectionError, requests.Timeout) as exc:
+                _registra(host, time.monotonic() - inicio, False, r["intervalo"])
                 raise Sobrecarga(f"{type(exc).__name__} em {host}") from exc
             motivo = None
             if resp.status_code in (403, 429) or resp.status_code >= 500:
@@ -161,6 +201,7 @@ class SessaoRitmada(requests.Session):
             elif _tem_aviso(resp):
                 motivo = f"aviso de excesso de consultas em {host}"
             r["ok"] = motivo is None
+            _registra(host, time.monotonic() - inicio, r["ok"], r["intervalo"])
         if motivo:
             raise Sobrecarga(motivo)
         return resp
