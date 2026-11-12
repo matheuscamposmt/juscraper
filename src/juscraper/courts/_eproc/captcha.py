@@ -340,24 +340,73 @@ RECONTA = 100
 """A cada tantas gravações, reconta a pasta: outros processos podem gravar nela."""
 
 
-def _grava_rotulado(pasta: Path, h: str) -> bool:
+def _grava_rotulado(
+    pasta: Path, h: str, amostra: str = "AMOSTRA", teto_var: str = "MAX_ROTULADOS", teto_padrao: int = 0
+) -> bool:
     """Se o exemplo rotulado vai para o disco.
 
     ``JUSCRAPER_CAPTCHA_MAX_ROTULADOS``: teto de arquivos na pasta (0 ou ausente:
     sem teto). ``JUSCRAPER_CAPTCHA_AMOSTRA=N``: grava 1 em N, escolhido pelo
     hash da imagem. O ``registro.jsonl`` guarda todos os resultados de qualquer
-    forma; o teto só limita as imagens, que crescem com a coleta.
+    forma; o teto só limita as imagens, que crescem com a coleta. ``amostra`` e
+    ``teto_var`` trocam o sufixo das duas variáveis (a pasta dos não aceitos usa
+    as suas); ``teto_padrao`` vale quando a variável do teto não está definida.
     """
-    n = int(os.environ.get("JUSCRAPER_CAPTCHA_AMOSTRA") or 1)
+    n = int(os.environ.get(f"JUSCRAPER_CAPTCHA_{amostra}") or 1)
     if n > 1 and int(h, 16) % n:
         return False
-    teto = int(os.environ.get("JUSCRAPER_CAPTCHA_MAX_ROTULADOS") or 0)
+    teto = int(os.environ.get(f"JUSCRAPER_CAPTCHA_{teto_var}") or teto_padrao)
     if not teto:
         return True
     if pasta not in _contagem or _gravados.get(pasta, 0) >= RECONTA:
         _contagem[pasta] = sum(1 for _ in pasta.iterdir()) if pasta.exists() else 0
         _gravados[pasta] = 0
     return _contagem[pasta] < teto
+
+
+def amostra_nao_aceitos() -> bool:
+    """Se ``JUSCRAPER_CAPTCHA_NAO_ACEITOS_AMOSTRA`` pede a amostra dos captchas nao aceitos."""
+    return int(os.environ.get("JUSCRAPER_CAPTCHA_NAO_ACEITOS_AMOSTRA") or 0) > 0
+
+
+def _grava_imagem(pasta: Path, nome: str, imagem: bytes) -> bool:
+    pasta.mkdir(exist_ok=True)
+    arq = pasta / nome
+    if arq.exists():
+        return False
+    arq.write_bytes(imagem)
+    _contagem[pasta] = _contagem.get(pasta, 0) + 1
+    _gravados[pasta] = _gravados.get(pasta, 0) + 1
+    return True
+
+
+def _grava_nao_aceito(d: Path, h: str, imagem: bytes, linha: dict) -> None:
+    """Amostra dos captchas descartados abaixo do limiar ou recusados pelo site, sem rotulo.
+
+    ``JUSCRAPER_CAPTCHA_NAO_ACEITOS_AMOSTRA=N`` grava 1 em N (pelo hash da imagem) em
+    ``nao_aceitos/``, com teto ``JUSCRAPER_CAPTCHA_MAX_NAO_ACEITOS`` (padrao 2.000). Ao lado,
+    ``nao_aceitos.jsonl`` traz tribunal, texto lido, confianca e motivo de cada imagem. Serve
+    para rotular a mao a cauda dificil, que os rotulados (so aceitos) nao mostram.
+    """
+    if not amostra_nao_aceitos():
+        return
+    pasta = d / "nao_aceitos"
+    if not _grava_rotulado(pasta, h, "NAO_ACEITOS_AMOSTRA", "MAX_NAO_ACEITOS", 2000):
+        return
+    motivo = "recusado" if linha["aceito"] is False else "abaixo_do_limiar"
+    trib = linha.get("tribunal") or "sem_tribunal"
+    if _grava_imagem(pasta, f"{trib}_{motivo}_{h}.png", imagem):
+        with (d / "nao_aceitos.jsonl").open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps({**linha, "motivo": motivo}, ensure_ascii=False) + "\n")
+
+
+_site: dict[str, str | None] = {"tribunal": None}
+"""Tribunal da consulta em curso, gravado em cada linha do registro (varios sites dividem um perfil)."""
+
+
+def define_tribunal(tribunal: str | None) -> None:
+    """Tribunal que :func:`registrar` grava nas linhas seguintes (``None`` para nenhum)."""
+    _site["tribunal"] = tribunal
 
 
 def registrar(perfil: str, imagem: bytes, texto: str, conf: float, *, aceito: bool | None) -> None:
@@ -369,23 +418,22 @@ def registrar(perfil: str, imagem: bytes, texto: str, conf: float, *, aceito: bo
         texto: palpite lido.
         conf: confianca do palpite.
         aceito: ``True`` ou ``False`` conforme a resposta do site; ``None`` se
-            o palpite nao foi enviado.
+            o palpite nao foi enviado. O tribunal vem de :func:`define_tribunal`.
     """
     d = _dir(perfil)
     # O hash so nomeia o arquivo e escolhe a amostra; nao protege nada.
     h = hashlib.sha1(imagem, usedforsecurity=False).hexdigest()[:12]
     pasta = d / "rotulados"
     if aceito and _grava_rotulado(pasta, h):
-        pasta.mkdir(exist_ok=True)
-        arq = pasta / f"{texto}_{h}.png"
-        if not arq.exists():
-            arq.write_bytes(imagem)
-            _contagem[pasta] = _contagem.get(pasta, 0) + 1
-            _gravados[pasta] = _gravados.get(pasta, 0) + 1
+        _grava_imagem(pasta, f"{texto}_{h}.png", imagem)
+    linha: dict[str, object] = {"t": round(time.time(), 1), "img": h, "texto": texto, "conf": conf, "aceito": aceito}
+    if _site["tribunal"]:
+        linha["tribunal"] = _site["tribunal"]
+    if _ab["ultima"]:
+        linha["variante"] = _ab["ultima"]
+    if not aceito:
+        _grava_nao_aceito(d, h, imagem, linha)
     with (d / "registro.jsonl").open("a", encoding="utf-8") as fh:
-        linha = {"t": round(time.time(), 1), "img": h, "texto": texto, "conf": conf, "aceito": aceito}
-        if _ab["ultima"]:
-            linha["variante"] = _ab["ultima"]
         fh.write(json.dumps(linha, ensure_ascii=False) + "\n")
 
 

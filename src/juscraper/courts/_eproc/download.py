@@ -125,7 +125,8 @@ def _palpite(png: bytes, n: int, log: Callable[[str], None]) -> tuple[str, float
     """Texto e confiança do OCR, ou ``None`` se o palpite não passa no limiar do perfil."""
     texto, lido, conf = ocr.resolver(png, "eproc")
     if texto is None:
-        if os.environ.get("JUSCRAPER_CAPTCHA_AB"):  # no teste A/B, o descarte também conta
+        # no teste A/B e na amostra dos não aceitos, o descarte também conta
+        if os.environ.get("JUSCRAPER_CAPTCHA_AB") or ocr.amostra_nao_aceitos():
             ocr.registrar("eproc", png, lido, conf, aceito=None)
         log(f"eproc: tentativa {n + 1}: palpite {lido!r} ({conf}) abaixo do limiar")
         return None
@@ -175,6 +176,7 @@ def consulta_numero(
         Sobrecarga: depois de ``RECUSAS_SEGUIDAS`` recusas por volume seguidas.
     """
     url = url_consulta(tribunal, grau)
+    ocr.define_tribunal(tribunal)
     c = contagem if contagem is not None else {}
     recusas = 0
     for n in range(TENTATIVAS):

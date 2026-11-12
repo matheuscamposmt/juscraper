@@ -11,8 +11,11 @@ def pasta(tmp_path, monkeypatch):
     monkeypatch.setenv("JUSCRAPER_CAPTCHA_DIR", str(tmp_path))
     monkeypatch.delenv("JUSCRAPER_CAPTCHA_MAX_ROTULADOS", raising=False)
     monkeypatch.delenv("JUSCRAPER_CAPTCHA_AMOSTRA", raising=False)
+    monkeypatch.delenv("JUSCRAPER_CAPTCHA_NAO_ACEITOS_AMOSTRA", raising=False)
+    monkeypatch.delenv("JUSCRAPER_CAPTCHA_MAX_NAO_ACEITOS", raising=False)
     monkeypatch.setattr(captcha, "_contagem", {})
     monkeypatch.setattr(captcha, "_gravados", {})
+    monkeypatch.setattr(captcha, "_site", {"tribunal": None})
     return tmp_path
 
 
@@ -66,3 +69,28 @@ def test_amostra_grava_uma_parte(pasta, monkeypatch):
         captcha.registrar("eproc", f"img{i}".encode(), f"ab{i}c", 0.9, aceito=True)
     n = len(_rotulados(pasta))
     assert 20 <= n <= 80  # ~1 em 4, escolhido pelo hash da imagem
+
+
+def test_tribunal_vai_na_linha_do_registro(pasta):
+    captcha.define_tribunal("tjpr")
+    captcha.registrar("eproc", b"a", "abcd", 0.9, aceito=True)
+    linha = json.loads((pasta / "eproc" / "registro.jsonl").read_text().splitlines()[0])
+    assert linha["tribunal"] == "tjpr"
+
+
+def test_nao_aceitos_so_com_a_variavel(pasta, monkeypatch):
+    captcha.define_tribunal("tjpr")
+    captcha.registrar("eproc", b"a", "abcd", 0.2, aceito=None)
+    assert not (pasta / "eproc" / "nao_aceitos").exists()
+    monkeypatch.setenv("JUSCRAPER_CAPTCHA_NAO_ACEITOS_AMOSTRA", "1")
+    monkeypatch.setenv("JUSCRAPER_CAPTCHA_MAX_NAO_ACEITOS", "2")
+    captcha.registrar("eproc", b"b", "abcd", 0.2, aceito=None)
+    captcha.define_tribunal("tjmg")
+    captcha.registrar("eproc", b"c", "abce", 0.9, aceito=False)
+    captcha.registrar("eproc", b"d", "abcf", 0.9, aceito=False)
+    captcha.registrar("eproc", b"e", "abcg", 0.9, aceito=True)
+    nomes = sorted(p.name.rsplit("_", 1)[0] for p in (pasta / "eproc" / "nao_aceitos").iterdir())
+    assert nomes == ["tjmg_recusado", "tjpr_abaixo_do_limiar"]
+    idx = [json.loads(x) for x in (pasta / "eproc" / "nao_aceitos.jsonl").read_text().splitlines()]
+    assert [(x["tribunal"], x["motivo"], x["texto"]) for x in idx] == [
+        ("tjpr", "abaixo_do_limiar", "abcd"), ("tjmg", "recusado", "abce")]
