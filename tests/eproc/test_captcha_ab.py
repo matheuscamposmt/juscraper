@@ -58,6 +58,32 @@ def test_dessat_so_quando_a_atual_nao_passa(monkeypatch):
     assert captcha.resolver(b"suja", "eproc")[0] == "ab12"
 
 
+@pytest.mark.usefixtures("pasta", "ab")
+@pytest.mark.parametrize(("variante", "terceira"), [("dessat_otsu", "otsu"), ("dessat_beta", "beta")])
+def test_cascata_le_a_terceira_so_quando_a_dessat_nao_passa(monkeypatch, variante, terceira):
+    monkeypatch.setenv("JUSCRAPER_CAPTCHA_AB", variante)
+    monkeypatch.setattr(captcha, "sem_saturados", lambda _img: b"limpa")
+    monkeypatch.setattr(captcha, "binariza_otsu", lambda _img: b"otsu")
+    lidas = []
+
+    def ler(img, *_args, modelo="geral", **_kwargs):
+        lidas.append(modelo if modelo == "beta" else img.decode())
+        return ("ef56", 0.9) if lidas[-1] == terceira else ("ab1", 0.2)
+
+    monkeypatch.setattr(captcha, "ler", ler)
+    assert captcha.resolver(b"suja", "eproc")[0] == "ef56"
+    assert lidas == ["suja", "limpa", terceira]
+    lidas.clear()
+
+    def ler_passa(img, *_args, **_kwargs):
+        lidas.append(img)
+        return "cd34", 0.8
+
+    monkeypatch.setattr(captcha, "ler", ler_passa)
+    assert captcha.resolver(b"suja", "eproc")[0] == "cd34"
+    assert lidas == [b"suja"]
+
+
 def test_renormaliza_divide_pelas_permitidas():
     probs = [[0.2, 0.2, 0.6]]
     assert captcha.renormaliza(probs, ["", "a", "字"], {"a"}) == [[0.5, 0.5, 0.0]]

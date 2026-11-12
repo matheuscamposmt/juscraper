@@ -76,11 +76,18 @@ def _novo_motor() -> _Motor:
     return motor
 
 
-def _ocr() -> _Motor:
-    """Instancia do ddddocr usada nas leituras com probabilidade."""
-    if "geral" not in _MOTORES:
-        _MOTORES["geral"] = _novo_motor()
-    return _MOTORES["geral"]
+def _ocr(modelo: str = "geral") -> _Motor:
+    """Instancia do ddddocr usada nas leituras com probabilidade.
+
+    ``modelo="beta"`` e o outro modelo do pacote (``beta=True``), criado so na
+    primeira leitura que o pede (cerca de 80 MB a mais de memoria).
+    """
+    if modelo not in _MOTORES:
+        if modelo == "beta":
+            _MOTORES[modelo] = import_module("ddddocr").DdddOcr(show_ad=False, beta=True)
+        else:
+            _MOTORES[modelo] = _novo_motor()
+    return _MOTORES[modelo]
 
 
 def _indices(charset: Sequence[str], permitidos: Container[str]) -> list[int]:
@@ -189,6 +196,16 @@ def sem_saturados(png: bytes, limiar: int = 100, brilho: int = 200) -> bytes:
     return saida
 
 
+def binariza_otsu(png: bytes) -> bytes:
+    """Cinza binarizado pelo limiar de Otsu, devolvido como PNG de tres canais."""
+    cv2 = import_module("cv2")
+    np = import_module("numpy")
+    cinza = cv2.cvtColor(cv2.imdecode(np.frombuffer(png, np.uint8), cv2.IMREAD_COLOR), cv2.COLOR_BGR2GRAY)
+    _, preto_e_branco = cv2.threshold(cinza, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    saida: bytes = cv2.imencode(".png", cv2.cvtColor(preto_e_branco, cv2.COLOR_GRAY2BGR))[1].tobytes()
+    return saida
+
+
 def renormaliza(
     probabilidades: Sequence[Sequence[object]], charset: Sequence[str], permitidos: Container[str]
 ) -> list[list[float]]:
@@ -217,10 +234,12 @@ def _ocr_faixa(alfabeto: str) -> _Motor:
     return _MOTORES["faixa"]
 
 
-def ler(imagem: bytes, perfil: str = "generico", *, renorm: bool = False) -> tuple[str, float]:
+def ler(
+    imagem: bytes, perfil: str = "generico", *, renorm: bool = False, modelo: str = "geral"
+) -> tuple[str, float]:
     """(texto, confianca) do OCR, restrito ao alfabeto do perfil."""
     p = PERFIS[perfil]
-    r = cast("dict[str, list]", _ocr().classification(imagem, probability=True))
+    r = cast("dict[str, list]", _ocr(modelo).classification(imagem, probability=True))
     # ddddocr 1.6 devolve "charset"/"probabilities"; o 1.5.6, ultimo para o
     # Python 3.9, devolve "charsets"/"probability".
     probs = r["probabilities"] if "probabilities" in r else r["probability"]
@@ -231,11 +250,13 @@ def ler(imagem: bytes, perfil: str = "generico", *, renorm: bool = False) -> tup
     return dec(probs, charset, set(p["alfabeto"]))
 
 
-VARIANTES = ("atual", "dessat", "renorm", "range")
+VARIANTES = ("atual", "dessat", "renorm", "range", "dessat_otsu", "dessat_beta")
 """Leituras do teste A/B (JUSCRAPER_CAPTCHA_AB="atual,dessat,renorm,range"), alternadas por captcha:
 
 * atual: a leitura do perfil e o limiar;
 * dessat: a atual; se nao passa, le de novo sem as linhas saturadas (sem requisicao a mais);
+* dessat_otsu: a dessat; se ainda nao passa, le a imagem original binarizada por Otsu;
+* dessat_beta: a dessat; se ainda nao passa, le a imagem original com o modelo beta;
 * renorm: confianca renormalizada sobre o alfabeto, mesmo limiar;
 * range: o texto do ddddocr com charset_range; envia se tiver o tamanho do perfil.
 """
@@ -263,10 +284,18 @@ def _le_variante(imagem: bytes, perfil: str, v: str) -> tuple[str, float]:
             texto = texto.lower()
         return texto, 1.0
     texto, conf = ler(imagem, perfil)
-    if v == "dessat" and not _passa(p, texto, conf):
+    if v.startswith("dessat") and not _passa(p, texto, conf):
         t2, c2 = ler(sem_saturados(imagem), perfil)
         if _passa(p, t2, c2):
             return t2, c2
+        if v == "dessat_otsu":
+            t3, c3 = ler(binariza_otsu(imagem), perfil)
+        elif v == "dessat_beta":
+            t3, c3 = ler(imagem, perfil, modelo="beta")
+        else:
+            return texto, conf
+        if _passa(p, t3, c3):
+            return t3, c3
     return texto, conf
 
 
