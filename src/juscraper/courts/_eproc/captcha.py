@@ -274,6 +274,52 @@ def _passa(p: Perfil, texto: str, conf: float) -> bool:
     return p["tamanho"][0] <= len(texto) <= p["tamanho"][1] and conf >= p["limiar"]
 
 
+_leitura: dict[str, object] = {"etapa": None, "leituras": {}}
+"""A leitura mais recente de :func:`resolver`: a etapa da cascata que decidiu (``atual``,
+``dessat``, ``otsu``, ``beta``; ``nenhuma`` se nenhuma passou) e o texto e a confianca de cada
+etapa lida. :func:`registrar` grava a etapa no registro e as leituras nos indices."""
+
+_TERCEIRA = {"dessat_otsu": "otsu", "dessat_beta": "beta"}
+"""Variante em cascata -> nome da terceira leitura."""
+
+
+def _terceira(imagem: bytes, perfil: str, etapa: str) -> tuple[str, float]:
+    if etapa == "otsu":
+        return ler(binariza_otsu(imagem), perfil)
+    return ler(imagem, perfil, modelo="beta")
+
+
+def _anota(nome: str, texto: str, conf: float, p: Perfil) -> bool:
+    """Guarda a leitura da etapa; se passa no limiar, ela decide."""
+    cast("dict[str, list]", _leitura["leituras"])[nome] = [texto, conf]
+    if _passa(p, texto, conf):
+        _leitura["etapa"] = nome
+        return True
+    return False
+
+
+def _cascata(imagem: bytes, perfil: str, v: str) -> tuple[str, float]:
+    """atual, depois dessat, depois a terceira leitura da variante; cada uma so se a anterior nao passou."""
+    p = PERFIS[perfil]
+    texto, conf = ler(imagem, perfil)
+    _leitura.update(etapa="atual", leituras={"atual": [texto, conf]})
+    if _passa(p, texto, conf):
+        return texto, conf
+    if not v.startswith("dessat"):
+        _leitura["etapa"] = "nenhuma"
+        return texto, conf
+    t, c = ler(sem_saturados(imagem), perfil)
+    if _anota("dessat", t, c, p):
+        return t, c
+    nome = _TERCEIRA.get(v)
+    if nome:
+        t, c = _terceira(imagem, perfil, nome)
+        if _anota(nome, t, c, p):
+            return t, c
+    _leitura["etapa"] = "nenhuma"
+    return texto, conf
+
+
 def _le_variante(imagem: bytes, perfil: str, v: str) -> tuple[str, float]:
     p = PERFIS[perfil]
     if v == "renorm":
@@ -283,20 +329,7 @@ def _le_variante(imagem: bytes, perfil: str, v: str) -> tuple[str, float]:
         if not p.get("caixa", True):
             texto = texto.lower()
         return texto, 1.0
-    texto, conf = ler(imagem, perfil)
-    if v.startswith("dessat") and not _passa(p, texto, conf):
-        t2, c2 = ler(sem_saturados(imagem), perfil)
-        if _passa(p, t2, c2):
-            return t2, c2
-        if v == "dessat_otsu":
-            t3, c3 = ler(binariza_otsu(imagem), perfil)
-        elif v == "dessat_beta":
-            t3, c3 = ler(imagem, perfil, modelo="beta")
-        else:
-            return texto, conf
-        if _passa(p, t3, c3):
-            return t3, c3
-    return texto, conf
+    return _cascata(imagem, perfil, v)
 
 
 def resolver(imagem: bytes, perfil: str = "generico") -> tuple[str | None, str, float]:
@@ -309,6 +342,7 @@ def resolver(imagem: bytes, perfil: str = "generico") -> tuple[str | None, str, 
         ``(texto ou None, texto lido, confianca)``.
     """
     ab = [x for x in (os.environ.get("JUSCRAPER_CAPTCHA_AB") or "").split(",") if x in VARIANTES]
+    _leitura.update(etapa=None, leituras={})
     if ab:
         v = ab[_ab["n"] % len(ab)]
         _ab["n"] += 1
@@ -316,7 +350,7 @@ def resolver(imagem: bytes, perfil: str = "generico") -> tuple[str | None, str, 
         texto, conf = _le_variante(imagem, perfil, v)
     else:
         _ab["ultima"] = None
-        texto, conf = ler(imagem, perfil)
+        texto, conf = _cascata(imagem, perfil, "atual")
     p = PERFIS[perfil]
     if not _passa(p, texto, conf):
         return None, texto, conf
@@ -397,7 +431,23 @@ def _grava_nao_aceito(d: Path, h: str, imagem: bytes, linha: dict) -> None:
     trib = linha.get("tribunal") or "sem_tribunal"
     if _grava_imagem(pasta, f"{trib}_{motivo}_{h}.png", imagem):
         with (d / "nao_aceitos.jsonl").open("a", encoding="utf-8") as fh:
-            fh.write(json.dumps({**linha, "motivo": motivo}, ensure_ascii=False) + "\n")
+            fh.write(json.dumps({**linha, "motivo": motivo, "leituras": _leitura["leituras"]},
+                                ensure_ascii=False) + "\n")
+
+
+def _grava_resgatado(d: Path, h: str, imagem: bytes, linha: dict) -> None:
+    """Captcha que so a terceira leitura da cascata (otsu, beta) resolveu e o site aceitou.
+
+    Todos vao para ``resgatados/<texto>_<hash>.png``, sem amostra e fora do teto dos
+    rotulados, com teto proprio ``JUSCRAPER_CAPTCHA_MAX_RESGATADOS`` (padrao 5.000). O rotulo
+    vem do site. ``resgatados.jsonl`` traz o tribunal e a leitura de cada etapa.
+    """
+    pasta = d / "resgatados"
+    if not _grava_rotulado(pasta, h, "AMOSTRA_RESGATADOS", "MAX_RESGATADOS", 5000):
+        return
+    if _grava_imagem(pasta, f"{linha['texto']}_{h}.png", imagem):
+        with (d / "resgatados.jsonl").open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps({**linha, "leituras": _leitura["leituras"]}, ensure_ascii=False) + "\n")
 
 
 _site: dict[str, str | None] = {"tribunal": None}
@@ -431,8 +481,12 @@ def registrar(perfil: str, imagem: bytes, texto: str, conf: float, *, aceito: bo
         linha["tribunal"] = _site["tribunal"]
     if _ab["ultima"]:
         linha["variante"] = _ab["ultima"]
+    if _leitura["etapa"]:
+        linha["etapa"] = _leitura["etapa"]
     if not aceito:
         _grava_nao_aceito(d, h, imagem, linha)
+    elif _leitura["etapa"] in _TERCEIRA.values():
+        _grava_resgatado(d, h, imagem, linha)
     with (d / "registro.jsonl").open("a", encoding="utf-8") as fh:
         fh.write(json.dumps(linha, ensure_ascii=False) + "\n")
 
