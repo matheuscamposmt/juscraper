@@ -83,7 +83,12 @@ def estado(html: str) -> str:
 
 def build_search_payload(form_html: str, numero: str, captcha_texto: str) -> dict[str, str]:
     """Campos do formulário: os ocultos e de texto da página, o número e o captcha."""
-    form = BeautifulSoup(form_html, "html.parser").find("form")
+    return _payload(BeautifulSoup(form_html, "html.parser"), numero, captcha_texto)
+
+
+def _payload(so: BeautifulSoup, numero: str, captcha_texto: str) -> dict[str, str]:
+    """O ``build_search_payload`` sobre a página já lida."""
+    form = so.find("form")
     dados = {x.get("name"): x.get("value") or "" for x in form.find_all("input")
              if x.get("name") and x.get("type") in ("hidden", "text")}
     dados.update(txtNumProcesso=re.sub(r"\D", "", numero), txtInfraCaptcha=captcha_texto,
@@ -93,7 +98,11 @@ def build_search_payload(form_html: str, numero: str, captcha_texto: str) -> dic
 
 def extrai_captcha(form_html: str) -> bytes | None:
     """PNG do captcha embutido na página, ou ``None`` se não houver captcha de imagem."""
-    so = BeautifulSoup(form_html, "html.parser")
+    return _captcha(BeautifulSoup(form_html, "html.parser"))
+
+
+def _captcha(so: BeautifulSoup) -> bytes | None:
+    """O ``extrai_captcha`` sobre a página já lida."""
     img = next((i for i in so.find_all("img") if i.get("src", "").startswith("data:image")
                 and i.get("id") != "infraImgAudioCaptcha"), None)
     return base64.b64decode(img["src"].split(",", 1)[1]) if img else None
@@ -133,11 +142,14 @@ def _palpite(png: bytes, n: int, log: Callable[[str], None]) -> tuple[str, float
     return texto, conf
 
 
-def _envia(s: SessaoRitmada, pagina: requests.Response, numero: str, texto: str) -> requests.Response:
-    """``POST`` do formulário da página, no host final do ``GET``, com o número e o captcha."""
-    form = BeautifulSoup(pagina.text, "html.parser").find("form")
-    return s.post(urljoin(pagina.url, form.get("action")),
-                  data=build_search_payload(pagina.text, numero, texto))
+def _envia(s: SessaoRitmada, pagina: requests.Response, so: BeautifulSoup, numero: str, texto: str
+           ) -> requests.Response:
+    """``POST`` do formulário da página, no host final do ``GET``, com o número e o captcha.
+
+    ``so`` é a ``pagina`` já lida pelo BeautifulSoup.
+    """
+    form = so.find("form")
+    return s.post(urljoin(pagina.url, form.get("action")), data=_payload(so, numero, texto))
 
 
 def _aceita(resp: requests.Response, png: bytes, palpite: tuple[str, float], n: int,
@@ -190,7 +202,10 @@ def consulta_numero(
             continue
         recusas = 0
         c["captchas"] = c.get("captchas", 0) + 1
-        png = extrai_captcha(pagina.text)
+        # Uma leitura da página por captcha (24/11/2026): o captcha, o form e o payload saíam de três
+        # (~20 ms de CPU cada numa página de 50 KB).
+        so = BeautifulSoup(pagina.text, "html.parser")
+        png = _captcha(so)
         if png is None:
             log(f"eproc: página sem captcha de imagem (HTTP {pagina.status_code})")
             return None
@@ -198,7 +213,7 @@ def consulta_numero(
         if palpite is None:
             continue
         try:
-            resp = _envia(s, pagina, numero, palpite[0])
+            resp = _envia(s, pagina, so, numero, palpite[0])
         except Sobrecarga as exc:
             recusas = _conta_recusa(recusas, exc, log, f"eproc: tentativa {n + 1}: {exc} no envio")
             continue
