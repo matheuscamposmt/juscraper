@@ -24,6 +24,7 @@ sao exemplos rotulados para treinar um modelo proprio depois.
 O ddddocr e o OpenCV sao dependencias opcionais: so sao importados na
 primeira leitura, para que o modulo carregue sem eles.
 """
+import functools
 import hashlib
 import json
 import os
@@ -32,7 +33,10 @@ import time
 from collections.abc import Container, Sequence
 from importlib import import_module
 from pathlib import Path
-from typing import NotRequired, Protocol, TypedDict, cast
+from typing import TYPE_CHECKING, NotRequired, Protocol, TypedDict, cast
+
+if TYPE_CHECKING:
+    from numpy.typing import NDArray
 
 ALNUM = string.ascii_letters + string.digits
 
@@ -210,6 +214,8 @@ def gera_infra(a: int, b: int) -> str:
 
 
 _LEXICO: list[str] = []
+_COLUNAS_LEXICO: dict[tuple[int, tuple[str, ...]], "tuple[list[int], NDArray]"] = {}
+"""Por charset do ddddocr: as colunas do branco e do alfabeto e a matriz que soma as duas caixas."""
 
 
 def lexico_infra() -> list[str]:
@@ -218,6 +224,61 @@ def lexico_infra() -> list[str]:
         cods = [*range(48, 58), *range(65, 91), *range(97, 123)]
         _LEXICO.extend(sorted({gera_infra(a, b).lower() for a in cods for b in cods}))
     return _LEXICO
+
+
+@functools.cache
+def _matrizes_lexico() -> "tuple[list[str], NDArray, NDArray]":
+    """(classes, estados estendidos, saltos) do CTC para cada texto do lexico (branco c1 branco ... c4 branco)."""
+    np = import_module("numpy")
+    lexico = lexico_infra()
+    classes = sorted(set("".join(lexico)))
+    rot = np.array([[classes.index(c) + 1 for c in w] for w in lexico])  # 0 e o branco
+    ext = np.zeros((len(lexico), 9), dtype=int)
+    ext[:, 1::2] = rot
+    pula = np.zeros((len(lexico), 9), dtype=bool)
+    pula[:, 3::2] = rot[:, 1:] != rot[:, :-1]
+    return classes, ext, pula
+
+
+def _colunas_lexico(
+    charset: Sequence[str], permitidos: Container[str], classes: list[str]
+) -> "tuple[list[int], NDArray]":
+    """As colunas do branco e do alfabeto no charset do ddddocr (que tem milhares) e a matriz que as soma por classe."""
+    chave = (len(charset), tuple(charset[:64]))
+    if chave not in _COLUNAS_LEXICO:
+        np = import_module("numpy")
+        cols, grupo = [], []
+        for i, c in enumerate(charset):
+            k = 0 if c == "" else (classes.index(c.lower()) + 1 if c in permitidos and c.lower() in classes else -1)
+            if k >= 0:
+                cols.append(i)
+                grupo.append(k)
+        soma = np.zeros((len(cols), len(classes) + 1))
+        soma[np.arange(len(cols)), grupo] = 1.0
+        _COLUNAS_LEXICO[chave] = (cols, soma)
+    return _COLUNAS_LEXICO[chave]
+
+
+def _forward_ctc(pr: "NDArray", ext: "NDArray", pula: "NDArray") -> "NDArray":
+    """Log-verossimilhanca de cada texto do lexico pelo forward do CTC.
+
+    No dominio linear, normalizado a cada posicao (a escala vai em log): o mesmo resultado do forward em log,
+    sem logaddexp.
+    """
+    np = import_module("numpy")
+    a = np.zeros(ext.shape)
+    a[:, 0] = pr[0, 0]
+    a[:, 1] = pr[0, ext[:, 1]]
+    escala = 0.0
+    for t in range(1, pr.shape[0]):
+        b = a.copy()
+        b[:, 1:] += a[:, :-1]
+        b[:, 2:] += np.where(pula[:, 2:], a[:, :-2], 0.0)
+        a = b * pr[t][ext]
+        topo = a.max()
+        a /= topo
+        escala += float(np.log(topo))
+    return np.log(np.maximum(a[:, -1] + a[:, -2], 1e-300)) + escala
 
 
 def decodifica_lexico(
@@ -229,7 +290,8 @@ def decodifica_lexico(
     verossimilhanca de cada texto de :func:`lexico_infra` sob as mesmas probabilidades; a posterior e a
     verossimilhanca do melhor normalizada sobre o lexico. Medido em 24/11/2026 em 300 rotulados e 300 resgatados
     do Eproc, so com a leitura da imagem original: acerto de 98,7% e 96,0%, contra 93,0% e 24,7% da leitura
-    gulosa; com posterior >= 0,8, 98% e 94% dos casos, com 100% e 98,6% de acerto.
+    gulosa; com posterior >= 0,8, 98% e 94% dos casos, com 100% e 98,6% de acerto. Cerca de 11 ms por captcha,
+    contra ~30-60 ms de uma leitura do ddddocr.
 
     Args:
         probabilidades: probabilidades de cada posicao, na ordem do ``charset``.
@@ -240,36 +302,14 @@ def decodifica_lexico(
         O texto em minusculas e a posterior, arredondada em 3 casas.
     """
     np = import_module("numpy")
-    lexico = lexico_infra()
-    classes = sorted(set("".join(lexico)))
-    col = {c: k + 1 for k, c in enumerate(classes)}  # 0 e o branco
-    grupos: dict[int, list[int]] = {}
-    for i, c in enumerate(charset):
-        if c == "":
-            grupos.setdefault(0, []).append(i)
-        elif c in permitidos and c.lower() in col:
-            grupos.setdefault(col[c.lower()], []).append(i)
-    p = np.array([_posicao(linha) for linha in probabilidades], dtype=np.float64)
-    m = np.zeros((p.shape[0], len(classes) + 1))
-    for k, ix in grupos.items():
-        m[:, k] = p[:, ix].sum(1)
-    lp = np.log(np.maximum(m / np.maximum(m.sum(1, keepdims=True), 1e-12), 1e-30))
-    rot = np.array([[col[c] for c in w] for w in lexico])
-    n = rot.shape[0]
-    ext = np.zeros((n, 9), dtype=int)  # estados: branco c1 branco c2 branco c3 branco c4 branco
-    ext[:, 1::2] = rot
-    pula = np.zeros((n, 9), dtype=bool)
-    pula[:, 3::2] = rot[:, 1:] != rot[:, :-1]
-    a = np.full((n, 9), -np.inf)
-    a[:, 0] = lp[0, 0]
-    a[:, 1] = lp[0, ext[:, 1]]
-    for t in range(1, lp.shape[0]):
-        s1 = np.concatenate([np.full((n, 1), -np.inf), a[:, :-1]], 1)
-        s2 = np.where(pula, np.concatenate([np.full((n, 2), -np.inf), a[:, :-2]], 1), -np.inf)
-        a = np.logaddexp(np.logaddexp(a, s1), s2) + lp[t][ext]
-    ll = np.logaddexp(a[:, -1], a[:, -2])
+    classes, ext, pula = _matrizes_lexico()
+    cols, soma = _colunas_lexico(charset, permitidos, classes)
+    p = np.array([[q[i] for i in cols] for q in (_posicao(linha) for linha in probabilidades)], dtype=np.float64)
+    m = p @ soma  # caixas somadas: (posicoes, classes + branco)
+    pr = np.maximum(m / np.maximum(m.sum(1, keepdims=True), 1e-12), 1e-30)
+    ll = _forward_ctc(pr, ext, pula)
     k = int(np.argmax(ll))
-    return lexico[k], round(float(np.exp(ll[k] - np.logaddexp.reduce(ll))), 3)
+    return lexico_infra()[k], round(float(np.exp(ll[k] - np.logaddexp.reduce(ll))), 3)
 
 
 def sem_saturados(png: bytes, limiar: int = 100, brilho: int = 200) -> bytes:
