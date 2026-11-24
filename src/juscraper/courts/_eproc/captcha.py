@@ -213,17 +213,20 @@ def gera_infra(a: int, b: int) -> str:
     return chr(a) + chr(b) + chr(c3) + chr(c4)
 
 
-_LEXICO: list[str] = []
 _COLUNAS_LEXICO: dict[tuple[int, tuple[str, ...]], "tuple[list[int], NDArray]"] = {}
 """Por charset do ddddocr: as colunas do branco e do alfabeto e a matriz que soma as duas caixas."""
 
 
-def lexico_infra() -> list[str]:
-    """Os textos que o InfraCaptcha gera, em minusculas (2.766 de 36**4), montados na primeira chamada."""
-    if not _LEXICO:
-        cods = [*range(48, 58), *range(65, 91), *range(97, 123)]
-        _LEXICO.extend(sorted({gera_infra(a, b).lower() for a in cods for b in cods}))
-    return _LEXICO
+@functools.cache
+def lexico_infra() -> tuple[str, ...]:
+    """Os textos que o InfraCaptcha gera, em minusculas (2.766 de 36**4), montados na primeira chamada.
+
+    Montados de uma vez e devolvidos inteiros: as consultas do Eproc rodam em varias threads, e uma lista global
+    preenchida aos poucos saia com cada texto em dobro quando duas threads a montavam juntas (24/11/2026: posterior
+    presa em 0,5 e nenhum envio).
+    """
+    cods = [*range(48, 58), *range(65, 91), *range(97, 123)]
+    return tuple(sorted({gera_infra(a, b).lower() for a in cods for b in cods}))
 
 
 @functools.cache

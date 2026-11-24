@@ -1,5 +1,7 @@
 """Variante ``lexico`` do captcha do Eproc: so os textos do InfraCaptcha, pela posterior. Sem rede e sem ddddocr."""
 import json
+import sys
+import threading
 
 import pytest
 
@@ -69,3 +71,30 @@ def test_variante_lexico_envia_pela_posterior_e_registra_a_etapa(pasta, monkeypa
     captcha.registrar("eproc", b"y", "yott", 0.6, aceito=None)
     linhas = [json.loads(x) for x in (pasta / "eproc" / "registro.jsonl").read_text().splitlines()]
     assert [(x["variante"], x["etapa"]) for x in linhas] == [("lexico", "lexico"), ("lexico", "nenhuma")]
+
+
+def test_decodifica_lexico_em_varias_threads_com_o_cache_vazio(monkeypatch):
+    # 24/11/2026: com 7 vagas, duas threads montavam o lexico juntas e cada texto saia em dobro (posterior 0,5).
+    # Com a troca de thread a cada microssegundo, o codigo antigo saia com 13.830 e 22.128 textos.
+    intervalo = sys.getswitchinterval()
+    sys.setswitchinterval(1e-6)
+    captcha.lexico_infra.cache_clear()
+    vars(captcha)["_matrizes_lexico"].cache_clear()  # cache privado, zerado como o _ab dos outros testes
+    monkeypatch.setattr(captcha, "_COLUNAS_LEXICO", {})
+    probs = _probs("OBYX")
+    saidas, barreira = [], threading.Barrier(8)
+
+    def roda():
+        barreira.wait()
+        saidas.append(captcha.decodifica_lexico(probs, CHARSET, set(captcha.ALNUM)))
+
+    ts = [threading.Thread(target=roda) for _ in range(8)]
+    for t in ts:
+        t.start()
+    for t in ts:
+        t.join()
+    sys.setswitchinterval(intervalo)
+    assert len(captcha.lexico_infra()) == 2766
+    assert len(set(saidas)) == 1
+    assert saidas[0][0] == "obyx"
+    assert saidas[0][1] >= captcha.LIMIAR_LEXICO
