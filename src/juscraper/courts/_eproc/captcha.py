@@ -180,6 +180,98 @@ def decodifica_sem_caixa(
     return texto, round(conf, 3)
 
 
+NAO_INFRA = frozenset(range(58, 65)) | frozenset(range(91, 97))
+"""Codigos ASCII entre os digitos e as letras, que o InfraCaptcha pula."""
+
+LIMIAR_LEXICO = 0.8
+"""Posterior minima do melhor texto do lexico para enviar o palpite (variante ``lexico``)."""
+
+
+def gera_infra(a: int, b: int) -> str:
+    """Texto do InfraCaptcha (framework do TRF4, usado pelo Eproc) a partir dos codigos dos dois primeiros caracteres.
+
+    O terceiro e o quarto caracteres saem dos dois primeiros: com ``x, y`` os codigos em ordem e ``m`` a metade
+    arredondada de ``y - x``, o terceiro e ``x + m`` e o quarto e ``y - m``; se o codigo cai entre os digitos e as
+    letras ou sai da faixa, fica ``x`` (ou ``y``). Medido em 24/11/2026 nos 50.078 captchas rotulados do Eproc
+    (TJMG, TJPR, TJAC e TJBA): a regra vale em todos, sem caixa (2% num controle com os dois ultimos embaralhados).
+
+    Args:
+        a: codigo do primeiro caractere.
+        b: codigo do segundo caractere.
+
+    Returns:
+        O texto de 4 caracteres.
+    """
+    x, y = sorted((a, b))
+    m = (y - x + 1) // 2
+    c3 = x if (x + m in NAO_INFRA or x + m > 122) else x + m
+    c4 = y if (y - m in NAO_INFRA or y - m < 48) else y - m
+    return chr(a) + chr(b) + chr(c3) + chr(c4)
+
+
+_LEXICO: list[str] = []
+
+
+def lexico_infra() -> list[str]:
+    """Os textos que o InfraCaptcha gera, em minusculas (2.766 de 36**4), montados na primeira chamada."""
+    if not _LEXICO:
+        cods = [*range(48, 58), *range(65, 91), *range(97, 123)]
+        _LEXICO.extend(sorted({gera_infra(a, b).lower() for a in cods for b in cods}))
+    return _LEXICO
+
+
+def decodifica_lexico(
+    probabilidades: Sequence[Sequence[object]], charset: Sequence[str], permitidos: Container[str]
+) -> tuple[str, float]:
+    """O texto do lexico do InfraCaptcha mais provavel e a probabilidade dele entre os textos do lexico.
+
+    Soma as duas caixas de cada letra (como :func:`decodifica_sem_caixa`) e calcula, pelo forward do CTC, a
+    verossimilhanca de cada texto de :func:`lexico_infra` sob as mesmas probabilidades; a posterior e a
+    verossimilhanca do melhor normalizada sobre o lexico. Medido em 24/11/2026 em 300 rotulados e 300 resgatados
+    do Eproc, so com a leitura da imagem original: acerto de 98,7% e 96,0%, contra 93,0% e 24,7% da leitura
+    gulosa; com posterior >= 0,8, 98% e 94% dos casos, com 100% e 98,6% de acerto.
+
+    Args:
+        probabilidades: probabilidades de cada posicao, na ordem do ``charset``.
+        charset: caracteres do modelo; ``""`` e o branco.
+        permitidos: caracteres que podem sair no texto, em qualquer caixa.
+
+    Returns:
+        O texto em minusculas e a posterior, arredondada em 3 casas.
+    """
+    np = import_module("numpy")
+    lexico = lexico_infra()
+    classes = sorted(set("".join(lexico)))
+    col = {c: k + 1 for k, c in enumerate(classes)}  # 0 e o branco
+    grupos: dict[int, list[int]] = {}
+    for i, c in enumerate(charset):
+        if c == "":
+            grupos.setdefault(0, []).append(i)
+        elif c in permitidos and c.lower() in col:
+            grupos.setdefault(col[c.lower()], []).append(i)
+    p = np.array([_posicao(linha) for linha in probabilidades], dtype=np.float64)
+    m = np.zeros((p.shape[0], len(classes) + 1))
+    for k, ix in grupos.items():
+        m[:, k] = p[:, ix].sum(1)
+    lp = np.log(np.maximum(m / np.maximum(m.sum(1, keepdims=True), 1e-12), 1e-30))
+    rot = np.array([[col[c] for c in w] for w in lexico])
+    n = rot.shape[0]
+    ext = np.zeros((n, 9), dtype=int)  # estados: branco c1 branco c2 branco c3 branco c4 branco
+    ext[:, 1::2] = rot
+    pula = np.zeros((n, 9), dtype=bool)
+    pula[:, 3::2] = rot[:, 1:] != rot[:, :-1]
+    a = np.full((n, 9), -np.inf)
+    a[:, 0] = lp[0, 0]
+    a[:, 1] = lp[0, ext[:, 1]]
+    for t in range(1, lp.shape[0]):
+        s1 = np.concatenate([np.full((n, 1), -np.inf), a[:, :-1]], 1)
+        s2 = np.where(pula, np.concatenate([np.full((n, 2), -np.inf), a[:, :-2]], 1), -np.inf)
+        a = np.logaddexp(np.logaddexp(a, s1), s2) + lp[t][ext]
+    ll = np.logaddexp(a[:, -1], a[:, -2])
+    k = int(np.argmax(ll))
+    return lexico[k], round(float(np.exp(ll[k] - np.logaddexp.reduce(ll))), 3)
+
+
 def sem_saturados(png: bytes, limiar: int = 100, brilho: int = 200) -> bytes:
     """Pinta de branco os pixels saturados e claros (HSV do OpenCV, 0 a 255).
 
@@ -234,23 +326,29 @@ def _ocr_faixa(alfabeto: str) -> _Motor:
     return _MOTORES["faixa"]
 
 
-def ler(
-    imagem: bytes, perfil: str = "generico", *, renorm: bool = False, modelo: str = "geral"
-) -> tuple[str, float]:
-    """(texto, confianca) do OCR, restrito ao alfabeto do perfil."""
-    p = PERFIS[perfil]
+def _probabilidades(imagem: bytes, modelo: str = "geral") -> tuple[list, list]:
+    """(probabilidades por posicao, charset) do ddddocr."""
     r = cast("dict[str, list]", _ocr(modelo).classification(imagem, probability=True))
     # ddddocr 1.6 devolve "charset"/"probabilities"; o 1.5.6, ultimo para o
     # Python 3.9, devolve "charsets"/"probability".
     probs = r["probabilities"] if "probabilities" in r else r["probability"]
     charset = r["charset"] if "charset" in r else r["charsets"]
+    return probs, charset
+
+
+def ler(
+    imagem: bytes, perfil: str = "generico", *, renorm: bool = False, modelo: str = "geral"
+) -> tuple[str, float]:
+    """(texto, confianca) do OCR, restrito ao alfabeto do perfil."""
+    p = PERFIS[perfil]
+    probs, charset = _probabilidades(imagem, modelo)
     dec = decodifica if p.get("caixa", True) else decodifica_sem_caixa
     if renorm:
         probs = renormaliza(probs, charset, set(p["alfabeto"]))
     return dec(probs, charset, set(p["alfabeto"]))
 
 
-VARIANTES = ("atual", "dessat", "renorm", "range", "dessat_otsu", "dessat_beta")
+VARIANTES = ("atual", "dessat", "renorm", "range", "dessat_otsu", "dessat_beta", "lexico")
 """Leituras do teste A/B (JUSCRAPER_CAPTCHA_AB="atual,dessat,renorm,range"), alternadas por captcha:
 
 * atual: a leitura do perfil e o limiar;
@@ -259,6 +357,9 @@ VARIANTES = ("atual", "dessat", "renorm", "range", "dessat_otsu", "dessat_beta")
 * dessat_beta: a dessat; se ainda nao passa, le a imagem original com o modelo beta;
 * renorm: confianca renormalizada sobre o alfabeto, mesmo limiar;
 * range: o texto do ddddocr com charset_range; envia se tiver o tamanho do perfil.
+* lexico: uma leitura da imagem original, decodificada so entre os textos do InfraCaptcha
+  (:func:`decodifica_lexico`); envia se a posterior passa de :data:`LIMIAR_LEXICO`. Substitui o limiar de
+  confianca, o filtro de tamanho e a cascata.
 """
 
 
@@ -322,6 +423,11 @@ def _cascata(imagem: bytes, perfil: str, v: str) -> tuple[str, float]:
 
 def _le_variante(imagem: bytes, perfil: str, v: str) -> tuple[str, float]:
     p = PERFIS[perfil]
+    if v == "lexico":
+        probs, charset = _probabilidades(imagem)
+        texto, post = decodifica_lexico(probs, charset, set(p["alfabeto"]))
+        _leitura.update(etapa="lexico" if post >= LIMIAR_LEXICO else "nenhuma", leituras={"lexico": [texto, post]})
+        return texto, post
     if v == "renorm":
         return ler(imagem, perfil, renorm=True)
     if v == "range":
@@ -352,6 +458,8 @@ def resolver(imagem: bytes, perfil: str = "generico") -> tuple[str | None, str, 
         _ab["ultima"] = None
         texto, conf = _cascata(imagem, perfil, "atual")
     p = PERFIS[perfil]
+    if _ab["ultima"] == "lexico":
+        p = cast("Perfil", {**p, "limiar": LIMIAR_LEXICO})
     if not _passa(p, texto, conf):
         return None, texto, conf
     return texto, texto, conf
