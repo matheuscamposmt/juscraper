@@ -1,4 +1,5 @@
 """Variante ``lexico`` do captcha do Eproc: so os textos do InfraCaptcha, pela posterior. Sem rede e sem ddddocr."""
+import io
 import json
 import sys
 import threading
@@ -62,6 +63,7 @@ def pasta(tmp_path, monkeypatch):
 
 def test_variante_lexico_envia_pela_posterior_e_registra_a_etapa(pasta, monkeypatch):
     monkeypatch.setenv("JUSCRAPER_CAPTCHA_AB", "lexico")
+    monkeypatch.setattr(captcha, "_saida_onnx", lambda _img: None)  # sem a sessao exposta: o caminho das listas
     monkeypatch.setattr(captcha, "_probabilidades", lambda _img, _modelo="geral": ("p", "c"))
     monkeypatch.setattr(captcha, "decodifica_lexico", lambda *_a: ("yott", 0.95))
     assert captcha.resolver(b"x", "eproc") == ("yott", "yott", 0.95)
@@ -98,3 +100,56 @@ def test_decodifica_lexico_em_varias_threads_com_o_cache_vazio(monkeypatch):
     assert len(set(saidas)) == 1
     assert saidas[0][0] == "obyx"
     assert saidas[0][1] >= captcha.LIMIAR_LEXICO
+
+
+def _logits(texto, extras=3000, semente=1):
+    """Saida antes do softmax: o texto em CTC sobre ruido, com milhares de colunas fora do alfabeto (como o ddddocr)."""
+    np = pytest.importorskip("numpy")
+    charset = CHARSET + [chr(0x4E00 + i) for i in range(extras)]
+    o = np.random.default_rng(semente).normal(0, 2, (2 * len(texto) + 2, 1, len(charset))).astype(np.float32)
+    for i, c in enumerate(texto):
+        o[2 * i, 0, charset.index(c)] += 9
+        o[2 * i + 1, 0, 0] += 9
+    return o, charset
+
+
+def test_decodifica_lexico_saida_igual_ao_softmax_inteiro():
+    np = pytest.importorskip("numpy")
+    for semente, texto in enumerate(["OBYX", "yott", "a1b2"]):
+        o, charset = _logits(texto, semente=semente)
+        e = np.exp(o - o.max(2, keepdims=True))
+        probs = (e / e.sum(2, keepdims=True)).tolist()  # o que o ddddocr devolve com probability=True
+        assert captcha.decodifica_lexico_saida(o, charset, set(captcha.ALNUM)) == captcha.decodifica_lexico(
+            probs, charset, set(captcha.ALNUM)
+        )
+
+
+@pytest.mark.usefixtures("pasta")
+def test_variante_lexico_le_a_saida_do_modelo_sem_as_listas(monkeypatch):
+    monkeypatch.setenv("JUSCRAPER_CAPTCHA_AB", "lexico")
+    monkeypatch.setattr(captcha, "_saida_onnx", lambda _img: _logits("OBYX"))
+    monkeypatch.setattr(captcha, "_probabilidades", lambda *_a: pytest.fail("nao deve ler as listas"))
+    texto, lido, post = captcha.resolver(b"x", "eproc")
+    assert (texto, lido) == ("obyx", "obyx")
+    assert post >= captcha.LIMIAR_LEXICO
+
+
+def test_saida_onnx_tem_o_preparo_do_ddddocr():
+    """Com o ddddocr instalado, o softmax da saida direta e o que o ddddocr devolve com probability=True."""
+    pytest.importorskip("ddddocr")
+    np = pytest.importorskip("numpy")
+    image = pytest.importorskip("PIL.Image")
+    draw = pytest.importorskip("PIL.ImageDraw")
+    im = image.new("RGB", (135, 45), "white")
+    draw.Draw(im).text((10, 10), "obyx", fill="black")
+    buf = io.BytesIO()
+    im.save(buf, format="PNG")
+    png = buf.getvalue()
+
+    saida = vars(captcha)["_saida_onnx"](png)  # privadas, lidas como o _matrizes_lexico acima
+    assert saida is not None
+    o = saida[0].astype(np.float64)
+    e = np.exp(o - o.max(-1, keepdims=True))
+    probs, charset = vars(captcha)["_probabilidades"](png)
+    assert list(saida[1]) == list(charset)
+    assert np.allclose(e / e.sum(-1, keepdims=True), np.asarray(probs), atol=1e-6)

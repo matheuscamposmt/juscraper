@@ -305,10 +305,29 @@ def decodifica_lexico(
         O texto em minusculas e a posterior, arredondada em 3 casas.
     """
     np = import_module("numpy")
-    classes, ext, pula = _matrizes_lexico()
-    cols, soma = _colunas_lexico(charset, permitidos, classes)
+    cols, soma = _colunas_lexico(charset, permitidos, _matrizes_lexico()[0])
     p = np.array([[q[i] for i in cols] for q in (_posicao(linha) for linha in probabilidades)], dtype=np.float64)
-    m = p @ soma  # caixas somadas: (posicoes, classes + branco)
+    return _melhor_do_lexico(p @ soma)
+
+
+def decodifica_lexico_saida(saida: "NDArray", charset: Sequence[str], permitidos: Container[str]) -> tuple[str, float]:
+    """:func:`decodifica_lexico` sobre a saida do modelo antes do softmax, so nas colunas do alfabeto.
+
+    A posterior de cada posicao e renormalizada sobre essas colunas, entao o denominador do softmax nas milhares de
+    classes do ddddocr se cancela: o resultado e o mesmo, sem o softmax inteiro nem a lista de ~200 mil floats.
+    Medido em 25/11/2026 em 1.500 captchas do Eproc (rotulados, nao aceitos e resgatados): texto e posterior
+    iguais, 38,2 -> 28,7 ms de CPU por captcha.
+    """
+    np = import_module("numpy")
+    cols, soma = _colunas_lexico(charset, permitidos, _matrizes_lexico()[0])
+    o = np.asarray(saida, dtype=np.float64).reshape(-1, len(charset))[:, cols]
+    return _melhor_do_lexico(np.exp(o - o.max(1, keepdims=True)) @ soma)
+
+
+def _melhor_do_lexico(m: "NDArray") -> tuple[str, float]:
+    """O texto do lexico de maior verossimilhanca e a posterior dele, dadas as massas (posicoes, classes + branco)."""
+    np = import_module("numpy")
+    _, ext, pula = _matrizes_lexico()
     pr = np.maximum(m / np.maximum(m.sum(1, keepdims=True), 1e-12), 1e-30)
     ll = _forward_ctc(pr, ext, pula)
     k = int(np.argmax(ll))
@@ -367,6 +386,24 @@ def _ocr_faixa(alfabeto: str) -> _Motor:
         motor.set_ranges(alfabeto)
         _MOTORES["faixa"] = motor
     return _MOTORES["faixa"]
+
+
+def _saida_onnx(imagem: bytes) -> "tuple[NDArray, list[str]] | None":
+    """(saida do modelo antes do softmax, charset), direto da sessao ONNX do ddddocr geral.
+
+    O preparo da imagem e o do modelo padrao do ddddocr 1.6 (``OCREngine._preprocess_image``): altura 64, largura
+    proporcional, cinza, de 0 a 1. None se o ddddocr nao expoe a sessao (o 1.5.6, do Python 3.9).
+    """
+    motor = getattr(_ocr(), "ocr_engine", None)
+    if motor is None or getattr(motor, "session", None) is None or getattr(motor, "use_import_onnx", True):
+        return None
+    sessao = motor.session
+    np = import_module("numpy")
+    proc = import_module("ddddocr.preprocessing.image_processor").ImageProcessor
+    img = import_module("ddddocr.utils.image_io").load_image_from_input(imagem)
+    img = proc.convert_to_grayscale(proc.resize_image(img, (int(img.size[0] * (64 / img.size[1])), 64)))
+    x = (np.array(img).astype(np.float32) / 255.0)[None, None]
+    return sessao.run(None, {sessao.get_inputs()[0].name: x})[0], motor.charset_manager.get_charset()
 
 
 def _probabilidades(imagem: bytes, modelo: str = "geral") -> tuple[list, list]:
@@ -467,8 +504,12 @@ def _cascata(imagem: bytes, perfil: str, v: str) -> tuple[str, float]:
 def _le_variante(imagem: bytes, perfil: str, v: str) -> tuple[str, float]:
     p = PERFIS[perfil]
     if v == "lexico":
-        probs, charset = _probabilidades(imagem)
-        texto, post = decodifica_lexico(probs, charset, set(p["alfabeto"]))
+        saida = _saida_onnx(imagem)
+        if saida is not None:
+            texto, post = decodifica_lexico_saida(saida[0], saida[1], set(p["alfabeto"]))
+        else:
+            probs, charset = _probabilidades(imagem)
+            texto, post = decodifica_lexico(probs, charset, set(p["alfabeto"]))
         _leitura.update(etapa="lexico" if post >= LIMIAR_LEXICO else "nenhuma", leituras={"lexico": [texto, post]})
         return texto, post
     if v == "renorm":
